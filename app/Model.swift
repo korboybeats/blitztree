@@ -353,6 +353,9 @@ final class ScanModel {
             return TrashTarget(path: path, label: (path as NSString).lastPathComponent,
                                bytes: sizes[path] ?? 0, inTrash: TrashPlace.contains(path))
         }
+        // One delete at a time: a second Delete key or click while the
+        // confirmation, password dialog, or delete is up must not start
+        // another batch with its own dialogs.
         guard !trashingSelection, !scanning, !cleanupTrash.running else { return }
         if targets.isEmpty {
             if raw.contains(where: { !$0.isEmpty && $0 != "/" }) {
@@ -363,10 +366,22 @@ final class ScanModel {
             }
             return
         }
+        // Without Full Disk Access, macOS blocks these even for an
+        // administrator. Say so up front instead of confirm, password, fail.
+        if targets.allSatisfy({ TrashAccess.privacyBlocked($0.path) }) {
+            TrashUI.present(targets.map {
+                TrashFailure(label: $0.label, path: $0.path, message: "", permission: false,
+                             inTrash: $0.inTrash, bytes: $0.bytes).blockedByPrivacy()
+            })
+            return
+        }
         let permanent = targets.filter(\.inTrash)
         let movable = targets.filter { !$0.inTrash }
-        guard TrashUI.confirm(permanent: permanent, movable: movable) else { return }
         trashingSelection = true
+        guard TrashUI.confirm(permanent: permanent, movable: movable) else {
+            trashingSelection = false
+            return
+        }
         let scan = scanRoot
         Task {
             let outcome = await Task.detached(priority: .userInitiated) { () -> (failed: [TrashFailure], ok: Int) in
@@ -392,7 +407,7 @@ final class ScanModel {
                 }
                 return (failed, ok)
             }.value
-            let settled = TrashRetry.settle(outcome.failed, succeeded: outcome.ok, scanRoot: scan)
+            let settled = await TrashRetry.settle(outcome.failed, succeeded: outcome.ok, scanRoot: scan)
             trashingSelection = false
             if settled.succeeded > 0 {
                 selectionFromList = true

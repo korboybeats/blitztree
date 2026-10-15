@@ -86,7 +86,7 @@ final class CleanupTrashBatch {
             }.value
             // Permission errors share one administrator prompt. Anything else
             // keeps the per-item line the offline benchmark checks.
-            let settled = TrashRetry.settle(outcome.failed, succeeded: outcome.ok, scanRoot: root)
+            let settled = await TrashRetry.settle(outcome.failed, succeeded: outcome.ok, scanRoot: root)
             let strings = settled.failed.map { "\($0.label): \($0.message)" }
             failures.append(contentsOf: strings)
             running = false

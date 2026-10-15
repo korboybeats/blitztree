@@ -33,14 +33,39 @@ nonisolated enum TrashPaths {
     }
 
     /// `~/.Trash` for this user, in every path form macOS might report.
-    static func homeTrashForms() -> [String] {
+    static func homeTrashForms() -> [String] { cachedHomeTrashForms }
+
+    /// Computed once: menu titles and help text ask on every redraw, and
+    /// resolving symlinks there is a filesystem call on the main thread.
+    private static let cachedHomeTrashForms: [String] = {
         var seen = Set<String>()
         var out: [String] = []
         for form in forms(NSHomeDirectory() + "/.Trash") where seen.insert(form).inserted {
             out.append(form)
         }
         return out
+    }()
+}
+
+/// macOS privacy protection (TCC). Another user's `~/.Trash` and similar
+/// folders return EPERM to any process, root included, whose app lacks Full
+/// Disk Access. An administrator password cannot get past it, so these paths
+/// must not be sent to the admin retry; the user has to grant access instead.
+nonisolated enum TrashAccess {
+    /// True when macOS privacy protection, not file permissions, blocks `path`.
+    /// Plain permission problems are EACCES; TCC denials are EPERM.
+    static func privacyBlocked(_ path: String) -> Bool {
+        let parent = (path as NSString).deletingLastPathComponent
+        let fd = open(parent.isEmpty ? "/" : parent, O_RDONLY | O_DIRECTORY)
+        if fd >= 0 {
+            close(fd)
+            var st = stat()
+            return lstat(path, &st) != 0 && errno == EPERM
+        }
+        return errno == EPERM
     }
+
+    static let message = "macOS privacy protection blocked it. Give BlitzTree Full Disk Access."
 }
 
 nonisolated enum TrashPlace {
@@ -143,10 +168,17 @@ nonisolated struct TrashFailure: Sendable {
     var permission: Bool
     var inTrash: Bool
     var bytes: UInt64
+    /// Blocked by macOS privacy protection: only Full Disk Access helps.
+    var privacy = false
 
     func replacing(message: String, permission: Bool) -> TrashFailure {
         TrashFailure(label: label, path: path, message: message, permission: permission,
                      inTrash: inTrash, bytes: bytes)
+    }
+
+    func blockedByPrivacy() -> TrashFailure {
+        TrashFailure(label: label, path: path, message: TrashAccess.message, permission: false,
+                     inTrash: inTrash, bytes: bytes, privacy: true)
     }
 }
 
@@ -223,30 +255,6 @@ nonisolated enum TrashCopy {
         return Prompt(title: title, message: message, button: "Move to Trash")
     }
 
-    /// Delete in this app means "move to the Trash", which can be undone.
-    /// Administrator rights follow that: a file already in a Trash is removed
-    /// for good, and any other file is moved into its owner's Trash.
-    static func authorization(permanent: Int, permanentBytes: UInt64, move: Int, moveBytes: UInt64) -> Prompt {
-        if permanent > 0, move == 0 {
-            let noun = permanent == 1 ? "item" : "items"
-            return Prompt(
-                title: "Delete \(permanent) \(noun) permanently?",
-                message: "\(permanent == 1 ? "It's" : "They're") already in the Trash (\(Fmt.size(permanentBytes))), and you don't have permission to delete \(permanent == 1 ? "it" : "them"). This can't be undone. macOS will ask for an administrator password.",
-                button: "Delete Permanently")
-        }
-        if move > 0, permanent == 0 {
-            let noun = move == 1 ? "item" : "items"
-            return Prompt(
-                title: "Move \(move) \(noun) to the Trash?",
-                message: "You don't have permission to move \(move == 1 ? "it" : "them") (\(Fmt.size(moveBytes))). \(move == 1 ? "It goes" : "They go") into the owner's Trash, and you can put \(move == 1 ? "it" : "them") back from there. macOS will ask for an administrator password.",
-                button: "Authorize")
-        }
-        return Prompt(
-            title: "Delete \(permanent) and move \(move) with an administrator password?",
-            message: "\(describe(permanent, permanentBytes)) \(permanent == 1 ? "is" : "are") already in the Trash and will be deleted permanently. This can't be undone. \(describe(move, moveBytes)) will move into the owner's Trash, which you can put back.",
-            button: "Authorize")
-    }
-
     private static func describe(_ count: Int, _ bytes: UInt64) -> String {
         let noun = count == 1 ? "item" : "items"
         return "\(count) \(noun) (\(Fmt.size(bytes)))"
@@ -259,14 +267,23 @@ nonisolated enum TrashReport {
         var reason: String
         var details: String
         var count: Int
+        var privacy = 0
     }
 
     static func summarize(_ failures: [TrashFailure]) -> Summary {
-        summarize(lines: failures.map { "\($0.label): \($0.message)" },
-                  permission: failures.filter(\.permission).count)
+        var summary = summarize(lines: failures.map { "\($0.label): \($0.message)" },
+                                permission: failures.filter(\.permission).count)
+        summary.privacy = failures.filter(\.privacy).count
+        return summary
     }
 
     static func summarize(lines: [String]) -> Summary {
+        var summary = summarizeText(lines)
+        summary.privacy = lines.filter { $0.hasSuffix(TrashAccess.message) }.count
+        return summary
+    }
+
+    private static func summarizeText(_ lines: [String]) -> Summary {
         let permission = lines.filter { line in
             let text = line.lowercased()
             return text.contains("permission") || text.contains("not permitted")
@@ -334,30 +351,32 @@ enum TrashAdmin {
         var cancelled = false
     }
 
-    static func retry(_ items: [TrashFailure], scanRoot: String) -> Outcome {
+    /// The macOS password dialog is the only prompt here: the user already
+    /// confirmed the delete, and a second "are you sure" before the password
+    /// was one of a stack of dialogs for a single click. Runs off the main
+    /// thread so the window keeps responding while the password dialog is up.
+    static func retry(_ items: [TrashFailure], scanRoot: String) async -> Outcome {
         let eligible = items.filter { $0.permission && TrashSafety.allows($0.path, scanRoot: scanRoot) }
         guard !eligible.isEmpty else {
             return Outcome(failures: items, cancelled: true)
         }
-        let prompt = TrashCopy.authorization(
-            permanent: eligible.filter(\.inTrash).count,
-            permanentBytes: eligible.filter(\.inTrash).reduce(0) { $0 + $1.bytes },
-            move: eligible.filter { !$0.inTrash }.count,
-            moveBytes: eligible.filter { !$0.inTrash }.reduce(0) { $0 + $1.bytes })
-        let alert = NSAlert()
-        alert.alertStyle = eligible.contains(where: \.inTrash) ? .critical : .warning
-        alert.messageText = prompt.title
-        alert.informativeText = prompt.message
-        alert.addButton(withTitle: prompt.button)
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else {
-            return Outcome(failures: items, cancelled: true)
-        }
-        return run(eligible, scanRoot: scanRoot, original: items)
+        let fallback = TrashPaths.normalize(NSHomeDirectory() + "/.Trash")
+        let removing = eligible.filter(\.inTrash).count
+        let moving = eligible.count - removing
+        var parts: [String] = []
+        if removing > 0 { parts.append("delete \(removing) \(removing == 1 ? "item" : "items") permanently") }
+        if moving > 0 { parts.append("move \(moving) \(moving == 1 ? "item" : "items") to the owner's Trash") }
+        let why = "BlitzTree needs an administrator password to \(parts.joined(separator: " and "))."
+        return await Task.detached(priority: .userInitiated) {
+            run(eligible, scanRoot: scanRoot, original: items, fallback: fallback, prompt: why)
+        }.value
     }
 
-    private static func run(_ eligible: [TrashFailure], scanRoot: String, original: [TrashFailure]) -> Outcome {
-        let fallback = TrashPaths.normalize(NSHomeDirectory() + "/.Trash")
+    nonisolated private static func run(_ eligible: [TrashFailure], scanRoot: String, original: [TrashFailure],
+                                        fallback: String, prompt: String) -> Outcome {
+        let failed = { (message: String) in
+            Outcome(failures: eligible.map { $0.replacing(message: message, permission: true) })
+        }
         let directory = FileManager.default.temporaryDirectory
         let id = UUID().uuidString
         let scriptURL = directory.appendingPathComponent("blitztree-trash-\(id).sh")
@@ -374,29 +393,29 @@ enum TrashAdmin {
             FileManager.default.createFile(atPath: resultURL.path, contents: Data(),
                                            attributes: [.posixPermissions: 0o644])
         } catch {
-            return Outcome(failures: eligible.map {
-                $0.replacing(message: "The administrator authorization failed.", permission: true)
-            })
+            return failed("The administrator authorization failed.")
         }
-        guard let source = appleSource(script: scriptURL.path, list: listURL.path,
-                                        fallback: fallback, result: resultURL.path, scanRoot: scanRoot) else {
-            return Outcome(failures: eligible.map {
-                $0.replacing(message: "The administrator authorization failed.", permission: true)
-            })
+        guard let source = appleSource(script: scriptURL.path, list: listURL.path, fallback: fallback,
+                                        result: resultURL.path, scanRoot: scanRoot, prompt: prompt) else {
+            return failed("The administrator authorization failed.")
         }
-        var info: NSDictionary?
-        guard let runner = NSAppleScript(source: source) else {
-            return Outcome(failures: eligible.map {
-                $0.replacing(message: "The administrator authorization failed.", permission: true)
-            })
-        }
-        _ = runner.executeAndReturnError(&info)
-        if let info {
-            if appleErrorNumber(info) == -128 {
-                return Outcome(failures: original, cancelled: true)
-            }
-            let message = (info[NSAppleScript.errorMessage] as? String) ?? "The administrator authorization failed."
-            return Outcome(failures: eligible.map { $0.replacing(message: message, permission: true) })
+        // osascript instead of NSAppleScript: NSAppleScript must run on the
+        // main thread, which froze every button until the password dialog
+        // and the delete were done. A child process keeps this app as the
+        // responsible process, so its Full Disk Access still applies.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", source]
+        let errPipe = Pipe()
+        process.standardError = errPipe
+        process.standardOutput = FileHandle.nullDevice
+        do { try process.run() } catch { return failed("The administrator authorization failed.") }
+        let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        if process.terminationStatus != 0 {
+            let text = String(decoding: errData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            if text.contains("(-128)") { return Outcome(failures: original, cancelled: true) }
+            return failed(text.isEmpty ? "The administrator authorization failed." : text)
         }
         let parsed = parse(result: (try? Data(contentsOf: resultURL)) ?? Data())
         var outcome = Outcome()
@@ -411,6 +430,8 @@ enum TrashAdmin {
             } else if row.extra == "refused" {
                 outcome.failures.append(item.replacing(message: TrashSafety.refused(item.path).localizedDescription,
                                                        permission: false))
+            } else if row.extra == "privacy" {
+                outcome.failures.append(item.blockedByPrivacy())
             } else {
                 outcome.failures.append(item.replacing(message: row.extra.isEmpty ? "permission denied" : row.extra,
                                                        permission: true))
@@ -421,21 +442,22 @@ enum TrashAdmin {
 
     /// AppleScript string literal. Rejects control characters so a path cannot
     /// break out of the quoted script.
-    static func appleString(_ value: String) -> String? {
+    nonisolated static func appleString(_ value: String) -> String? {
         if value.unicodeScalars.contains(where: { $0.value < 0x20 }) { return nil }
         let escaped = value.replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
         return "\"\(escaped)\""
     }
 
-    private static func appleSource(script: String, list: String, fallback: String, result: String, scanRoot: String) -> String? {
+    nonisolated private static func appleSource(script: String, list: String, fallback: String, result: String,
+                                                scanRoot: String, prompt: String) -> String? {
         guard let scriptLit = appleString(script), let listLit = appleString(list),
               let fallbackLit = appleString(fallback), let resultLit = appleString(result),
-              let rootLit = appleString(scanRoot) else { return nil }
-        return "do shell script \"/bin/bash \" & quoted form of \(scriptLit) & \" \" & quoted form of \(listLit) & \" \" & quoted form of \(fallbackLit) & \" \" & quoted form of \(resultLit) & \" \" & quoted form of \(rootLit) with prompt \"BlitzTree needs permission to change items you can't access.\" with administrator privileges"
+              let rootLit = appleString(scanRoot), let promptLit = appleString(prompt) else { return nil }
+        return "do shell script \"/bin/bash \" & quoted form of \(scriptLit) & \" \" & quoted form of \(listLit) & \" \" & quoted form of \(fallbackLit) & \" \" & quoted form of \(resultLit) & \" \" & quoted form of \(rootLit) with prompt \(promptLit) with administrator privileges"
     }
 
-    private static func listData(_ items: [TrashFailure]) -> Data {
+    nonisolated private static func listData(_ items: [TrashFailure]) -> Data {
         var body = Data()
         func add(_ field: String) {
             body.append(contentsOf: field.utf8)
@@ -449,7 +471,7 @@ enum TrashAdmin {
         return body
     }
 
-    private static func parse(result data: Data) -> [String: (ok: Bool, extra: String)] {
+    nonisolated private static func parse(result data: Data) -> [String: (ok: Bool, extra: String)] {
         var fields: [String] = []
         var chunk = Data()
         for byte in data {
@@ -470,12 +492,6 @@ enum TrashAdmin {
         return map
     }
 
-    private static func appleErrorNumber(_ info: NSDictionary) -> Int? {
-        let value = info[NSAppleScript.errorNumber] ?? info["NSAppleScriptErrorNumber"]
-        if let number = value as? NSNumber { return number.intValue }
-        if let number = value as? Int { return number }
-        return nil
-    }
 
     nonisolated static let scriptSource = #"""
 #!/bin/bash
@@ -495,6 +511,15 @@ scanroot="${4:-}"
 write_result() {
   # $1 status, $2 path, $3 destination or message
   printf '%s\0%s\0%s\0' "$1" "$2" "$3" >> "$result"
+}
+
+# Root still gets EPERM ("Operation not permitted") from macOS privacy
+# protection when the app has no Full Disk Access; report that by name.
+why() {
+  case "$1" in
+    *"Operation not permitted"*) printf '%s' "privacy" ;;
+    *) printf '%s' "$2" ;;
+  esac
 }
 
 refuse() {
@@ -654,10 +679,10 @@ process_one() {
         write_result fail "$path" "refused"
         return
       fi
-      if /bin/rm -rf -- "$path"; then
+      if err=$(/bin/rm -rf -- "$path" 2>&1); then
         write_result ok "$path" ""
       else
-        write_result fail "$path" "couldn't delete"
+        write_result fail "$path" "$(why "$err" "couldn't delete")"
       fi
       ;;
     mv)
@@ -694,10 +719,10 @@ process_one() {
         write_result fail "$path" "name in use"
         return
       }
-      if /bin/mv -- "$path" "$dest_file"; then
+      if err=$(/bin/mv -- "$path" "$dest_file" 2>&1); then
         write_result ok "$path" "$dest_file"
       else
-        write_result fail "$path" "couldn't move to trash"
+        write_result fail "$path" "$(why "$err" "couldn't move to trash")"
       fi
       ;;
     *)
@@ -718,10 +743,16 @@ enum TrashRetry {
     /// Permission failures get one authorization prompt. Cancelling it leaves
     /// the original errors in place, so a dismissed password dialog is not a
     /// second failure for every file.
-    static func settle(_ failed: [TrashFailure], succeeded: Int, scanRoot: String) -> (failed: [TrashFailure], succeeded: Int) {
+    ///
+    /// A path behind macOS privacy protection is not retried: root is denied
+    /// too, so the password would be asked for and then fail anyway.
+    static func settle(_ raw: [TrashFailure], succeeded: Int, scanRoot: String) async -> (failed: [TrashFailure], succeeded: Int) {
+        let failed = await Task.detached(priority: .userInitiated) {
+            raw.map { $0.permission && TrashAccess.privacyBlocked($0.path) ? $0.blockedByPrivacy() : $0 }
+        }.value
         let eligible = failed.filter { $0.permission && TrashSafety.allows($0.path, scanRoot: scanRoot) }
         guard !eligible.isEmpty else { return (failed, succeeded) }
-        let outcome = TrashAdmin.retry(eligible, scanRoot: scanRoot)
+        let outcome = await TrashAdmin.retry(eligible, scanRoot: scanRoot)
         if outcome.cancelled { return (failed, succeeded) }
         let done = outcome.removed.union(outcome.moved.keys)
         let updates = Dictionary(outcome.failures.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
@@ -763,6 +794,10 @@ enum TrashUI {
 
     private static func present(_ summary: TrashReport.Summary) {
         guard summary.count > 0 else { return }
+        if summary.privacy > 0 {
+            presentPrivacy(summary)
+            return
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = summary.title
@@ -777,6 +812,24 @@ enum TrashUI {
         detail.accessoryView = detailView(summary.details)
         detail.addButton(withTitle: "OK")
         detail.runModal()
+    }
+
+    /// One clear way forward instead of a list of "Operation not permitted".
+    private static func presentPrivacy(_ summary: TrashReport.Summary) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = summary.count == 1
+            ? "BlitzTree needs Full Disk Access to delete this"
+            : "BlitzTree needs Full Disk Access to delete \(summary.privacy == summary.count ? "these \(summary.count) items" : "\(summary.privacy) of these items")"
+        alert.informativeText = "macOS protects other users' Trash and similar folders, even from an administrator. "
+            + "Open System Settings › Privacy & Security › Full Disk Access, turn on BlitzTree "
+            + "(add it with + from Applications if it isn't listed), then quit and reopen BlitzTree and delete again."
+        alert.addButton(withTitle: "Open Full Disk Access Settings")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private static func detailView(_ text: String) -> NSView {

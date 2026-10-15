@@ -849,7 +849,7 @@ final class AgentRun {
                 }
             }
             if !sink.values.isEmpty {
-                let retry = TrashAdmin.retry(sink.values, scanRoot: root)
+                let retry = await TrashAdmin.retry(sink.values, scanRoot: root)
                 if !retry.cancelled {
                     let asked = Set(sink.values.map(\.path))
                     for item in work {
@@ -936,7 +936,7 @@ final class AgentRun {
                 }
             }
             if !sink.values.isEmpty {
-                let retry = TrashAdmin.retry(sink.values, scanRoot: root)
+                let retry = await TrashAdmin.retry(sink.values, scanRoot: root)
                 if !retry.cancelled {
                     for item in work {
                         guard let paths = sink.pathsByItem[item.id] else { continue }

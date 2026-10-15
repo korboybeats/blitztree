@@ -431,7 +431,7 @@ private struct ListTrashBar: View {
                       systemImage: "trash")
             }
             .buttonStyle(.bordered)
-            .disabled(model.listSelection.isEmpty || model.scanning || model.trashingSelection || model.cleanupTrash.running)
+            .disabled(!model.listSelection.contains { $0 != 0 } || model.scanning || model.trashingSelection || model.cleanupTrash.running)
             .help("Move the selected items to the Trash")
             Spacer()
         }

@@ -89,6 +89,7 @@ nonisolated final class Tree: @unchecked Sendable {
     var listSelection: [Int] = []
     func selectedPaths() -> [String] { [] }
     func moveListSelectionToTrash() {}
+    func trashMenuTitle() -> String { "Move to Trash" }
     var scanRoot = "fixture"
     var agentRun: AgentRun?
 }

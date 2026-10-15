@@ -25,8 +25,14 @@ try:
     for path in sorted((ROOT / "app").glob("*.swift")):
         if path.name == "Main.swift":
             continue
-        source = (subprocess.check_output(["git", "show", f"{args.ref}:app/{path.name}"], cwd=ROOT).decode()
-                  if args.ref and not (args.ui_current and path.name in ("Model.swift", "ContentView.swift", "Cleanup.swift", "Agent.swift")) else path.read_text())
+        current_ui = {"Model.swift", "ContentView.swift", "Cleanup.swift", "Agent.swift", "TrashOps.swift"}
+        if not args.ref or (args.ui_current and path.name in current_ui):
+            source = path.read_text()
+        else:
+            try:
+                source = subprocess.check_output(["git", "show", f"{args.ref}:app/{path.name}"], cwd=ROOT).decode()
+            except subprocess.CalledProcessError:
+                continue
         if path.name == "ContentView.swift":
             source = source.replace("@State private var model = ScanModel()", "@State var model: ScanModel")
             source = source.replace("    var body: some View {", "    var body: some View {\n        let _ = UIHandoffMetrics.rootBodies += 1", 1)

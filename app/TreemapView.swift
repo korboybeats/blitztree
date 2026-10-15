@@ -532,7 +532,7 @@ final class NodeMenu: NSObject {
         let menu = NSMenu()
         for (title, action) in [("Reveal in Finder", #selector(revealInFinder(_:))),
                                 ("Copy Path", #selector(copyPath(_:))),
-                                ("Move to Trash", #selector(moveToTrash(_:)))] {
+                                (model.trashMenuTitle(), #selector(moveToTrash(_:)))] {
             if action == #selector(moveToTrash(_:)) { menu.addItem(.separator()) }
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = shared

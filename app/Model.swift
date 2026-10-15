@@ -311,8 +311,24 @@ final class ScanModel {
             guard id != 0 else { return nil }
             let path = tree.path(id)
             guard path != root, path != "/", seen.insert(path).inserted else { return nil }
+            guard TrashSafety.allows(path, scanRoot: root), TrashSafety.allows(path, scanRoot: scanRoot) else { return nil }
             return path
         }
+    }
+
+    /// Every selected path is already in a Trash, so Delete means permanent.
+    var listTrashIsPermanent: Bool {
+        let paths = pathsForTrash()
+        return !paths.isEmpty && paths.allSatisfy(TrashPlace.contains)
+    }
+
+    func trashMenuTitle() -> String {
+        let paths = pathsForTrash()
+        if paths.isEmpty { return "Move to Trash" }
+        if paths.allSatisfy(TrashPlace.contains) {
+            return paths.count == 1 ? "Delete Permanently" : "Delete \(paths.count) Permanently"
+        }
+        return paths.count == 1 ? "Move to Trash" : "Move \(paths.count) to Trash"
     }
 
     func moveListSelectionToTrash() {
@@ -321,50 +337,72 @@ final class ScanModel {
 
     /// Move every path, then rescan. The on-screen tree is the last scan;
     /// trashing files and leaving that tree up is why a delete looked like
-    /// it did nothing.
+    /// it did nothing. Items already in a Trash are deleted instead, and a
+    /// permission failure is retried once with an administrator password.
     func movePathsToTrash(_ raw: [String]) {
+        guard let tree else { return }
         var seen = Set<String>()
-        let paths = raw.filter { !$0.isEmpty && $0 != "/" && seen.insert($0).inserted }
-        guard !paths.isEmpty, !trashingSelection, !scanning, !cleanupTrash.running else { return }
-        let alert = NSAlert()
-        if paths.count == 1 {
-            let url = URL(fileURLWithPath: paths[0])
-            alert.messageText = "Move \u{201C}\(url.lastPathComponent)\u{201D} to Trash?"
-            alert.informativeText = paths[0]
-        } else {
-            alert.messageText = "Move \(paths.count) items to the Trash?"
-            alert.informativeText = "Folders and files in the selection move together. You can put them back from the Trash until you empty it."
+        let root = tree.path(0)
+        var sizes: [String: UInt64] = [:]
+        for id in ListSelection.outermost(listSelection, parents: tree.parents) where id != 0 {
+            sizes[tree.path(id)] = tree.alloc[id]
         }
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Move to Trash")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let targets: [TrashTarget] = raw.compactMap { path in
+            guard !path.isEmpty, path != "/", seen.insert(path).inserted else { return nil }
+            guard TrashSafety.allows(path, scanRoot: root), TrashSafety.allows(path, scanRoot: scanRoot) else { return nil }
+            return TrashTarget(path: path, label: (path as NSString).lastPathComponent,
+                               bytes: sizes[path] ?? 0, inTrash: TrashPlace.contains(path))
+        }
+        guard !trashingSelection, !scanning, !cleanupTrash.running else { return }
+        if targets.isEmpty {
+            if raw.contains(where: { !$0.isEmpty && $0 != "/" }) {
+                let alert = NSAlert()
+                alert.messageText = "These items can't be deleted"
+                alert.informativeText = "The selection is the scan root, a home folder, or another system location."
+                alert.runModal()
+            }
+            return
+        }
+        let permanent = targets.filter(\.inTrash)
+        let movable = targets.filter { !$0.inTrash }
+        guard TrashUI.confirm(permanent: permanent, movable: movable) else { return }
         trashingSelection = true
+        let scan = scanRoot
         Task {
-            let failed = await Task.detached(priority: .userInitiated) { () -> [String] in
-                var failed: [String] = []
-                for path in paths {
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (failed: [TrashFailure], ok: Int) in
+                var failed: [TrashFailure] = []
+                var ok = 0
+                for target in targets {
                     do {
-                        _ = try Trash.move(path)
+                        if !TrashSafety.allows(target.path, scanRoot: scan) || !TrashSafety.allows(target.path, scanRoot: root) {
+                            throw TrashSafety.refused(target.path)
+                        }
+                        if target.inTrash {
+                            try Trash.removeNow(target.path, scanRoot: scan)
+                        } else {
+                            _ = try Trash.move(target.path)
+                        }
+                        ok += 1
                     } catch {
-                        failed.append("\((path as NSString).lastPathComponent): \(error.localizedDescription)")
+                        let ns = error as NSError
+                        failed.append(TrashFailure(
+                            label: target.label, path: target.path, message: ns.localizedDescription,
+                            permission: TrashError.isPermission(ns), inTrash: target.inTrash, bytes: target.bytes))
                     }
                 }
-                return failed
+                return (failed, ok)
             }.value
+            let settled = TrashRetry.settle(outcome.failed, succeeded: outcome.ok, scanRoot: scan)
             trashingSelection = false
-            if failed.count < paths.count {
+            if settled.succeeded > 0 {
                 selectionFromList = true
                 listSelection = []
                 selection = nil
                 selectionFromList = false
                 startScan()
             }
-            if !failed.isEmpty {
-                let err = NSAlert()
-                err.messageText = failed.count == paths.count ? "Couldn't move to Trash" : "Some items couldn't be moved"
-                err.informativeText = failed.joined(separator: "\n")
-                err.runModal()
+            if !settled.failed.isEmpty {
+                TrashUI.present(settled.failed)
             }
         }
     }

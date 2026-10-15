@@ -427,12 +427,13 @@ private struct ListTrashBar: View {
             Button(role: .destructive) {
                 model.moveListSelectionToTrash()
             } label: {
-                Label(model.listSelection.count > 1 ? "Move \(model.listSelection.count) to Trash" : "Move to Trash",
-                      systemImage: "trash")
+                Label(model.trashMenuTitle(), systemImage: "trash")
             }
             .buttonStyle(.bordered)
             .disabled(!model.listSelection.contains { $0 != 0 } || model.scanning || model.trashingSelection || model.cleanupTrash.running)
-            .help("Move the selected items to the Trash")
+            .help(model.listTrashIsPermanent
+                  ? "Delete the selected items permanently. This can't be undone."
+                  : "Move the selected items to the Trash")
             Spacer()
         }
         .padding(.horizontal, 8)
@@ -444,6 +445,7 @@ private struct ListTrashBar: View {
 /// that is first responder never sees these events.
 final class DirectoryOutlineView: NSOutlineView {
     var onDelete: (() -> Void)?
+    var prepareMenu: (() -> Void)?
 
     override func keyDown(with event: NSEvent) {
         if window?.firstResponder is NSTextView {
@@ -474,6 +476,7 @@ final class DirectoryOutlineView: NSOutlineView {
             selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
         }
         let enabled = selectedRow >= 0
+        prepareMenu?()
         self.menu?.items.forEach { if !$0.isSeparatorItem { $0.isEnabled = enabled } }
         return self.menu
     }
@@ -803,6 +806,11 @@ struct OutlinePanel: NSViewRepresentable {
         outline.target = coord
         outline.doubleAction = #selector(Coordinator.doubleClicked(_:))
         outline.onDelete = { [weak coord] in coord?.deleteSelected(nil) }
+        outline.prepareMenu = { [weak coord] in
+            guard let menu = coord?.outline?.menu else { return }
+            let title = coord?.model?.trashMenuTitle() ?? "Move to Trash"
+            menu.items.first { $0.action == #selector(Coordinator.deleteSelected(_:)) }?.title = title
+        }
         let menu = NSMenu()
         for (title, action) in [("Reveal in Finder", #selector(Coordinator.revealSelected(_:))),
                                 ("Copy Path", #selector(Coordinator.copySelected(_:))),

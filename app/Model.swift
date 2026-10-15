@@ -153,6 +153,24 @@ enum MapStyle: String {
     case treemap, rings
 }
 
+/// Directory-list selection helpers shared by the outline and its tests.
+enum ListSelection {
+    /// Drop ids whose parent is also selected. Trashing a folder already
+    /// takes its selected children; trashing the child afterwards fails
+    /// because the path is gone.
+    static func outermost(_ ids: [Int], parents: UnsafePointer<UInt32>) -> [Int] {
+        let chosen = Set(ids)
+        return ids.filter { id in
+            var parent = Int(parents[id])
+            while parent != Int(UInt32.max) {
+                if chosen.contains(parent) { return false }
+                parent = Int(parents[parent])
+            }
+            return true
+        }
+    }
+}
+
 @Observable
 @MainActor
 final class ScanModel {
@@ -229,17 +247,126 @@ final class ScanModel {
     var hasShownTree = false
     var viewRoot: Int = 0 {
         didSet {
+            guard let tree else { return }
             // A selection outside the folder on screen would read as over 100%.
-            if let sel = selection, let tree, !tree.ancestry(sel).contains(viewRoot) { selection = nil }
+            if let sel = selection, !tree.ancestry(sel).contains(viewRoot) {
+                selection = nil
+                return
+            }
+            let kept = listSelection.filter { tree.ancestry($0).contains(viewRoot) }
+            if kept != listSelection {
+                selectionFromList = true
+                listSelection = kept
+                selectionFromList = false
+            }
         }
     }
-    var selection: Int? = nil
+    /// The row the map outlines. Assigning it from the map or a scan replaces
+    /// the directory list's selection with that one node. The list writes a
+    /// multi-selection through `replaceListSelection` instead.
+    var selection: Int? = nil {
+        didSet {
+            guard !selectionFromList else { return }
+            listSelection = selection.map { [$0] } ?? []
+        }
+    }
+    /// Nodes highlighted in the directory list, in outline row order.
+    var listSelection: [Int] = []
+    /// Set while the list is publishing its own selection, so `selection`'s
+    /// didSet does not collapse that selection back to one row.
+    private var selectionFromList = false
+    /// A directory-list trash is in flight. Scans wait until it finishes so
+    /// a rescan cannot snapshot the disk before the move lands.
+    var trashingSelection = false
 
     /// Select a node from a list, zooming out first if it is outside the
     /// folder on screen (it would have nothing to outline).
     func reveal(_ node: Int) {
         if let tree, !tree.ancestry(node).contains(viewRoot) { viewRoot = 0 }
         selection = node
+    }
+
+    /// Record the outline's selection without letting the single-node
+    /// assignment replace it.
+    func replaceListSelection(_ ids: [Int], anchor: Int?) {
+        selectionFromList = true
+        listSelection = ids
+        let next = anchor ?? ids.last
+        if selection != next { selection = next }
+        selectionFromList = false
+    }
+
+    func selectedPaths() -> [String] {
+        guard let tree else { return [] }
+        return listSelection.map { tree.path($0) }
+    }
+
+    /// Paths to move: a selected folder already contains its selected
+    /// descendants, and the scan root is the volume itself.
+    func pathsForTrash() -> [String] {
+        guard let tree else { return [] }
+        let root = tree.path(0)
+        var seen = Set<String>()
+        return ListSelection.outermost(listSelection, parents: tree.parents).compactMap { id in
+            guard id != 0 else { return nil }
+            let path = tree.path(id)
+            guard path != root, path != "/", seen.insert(path).inserted else { return nil }
+            return path
+        }
+    }
+
+    func moveListSelectionToTrash() {
+        movePathsToTrash(pathsForTrash())
+    }
+
+    /// Move every path, then rescan. The on-screen tree is the last scan;
+    /// trashing files and leaving that tree up is why a delete looked like
+    /// it did nothing.
+    func movePathsToTrash(_ raw: [String]) {
+        var seen = Set<String>()
+        let paths = raw.filter { !$0.isEmpty && $0 != "/" && seen.insert($0).inserted }
+        guard !paths.isEmpty, !trashingSelection, !scanning, !cleanupTrash.running else { return }
+        let alert = NSAlert()
+        if paths.count == 1 {
+            let url = URL(fileURLWithPath: paths[0])
+            alert.messageText = "Move \u{201C}\(url.lastPathComponent)\u{201D} to Trash?"
+            alert.informativeText = paths[0]
+        } else {
+            alert.messageText = "Move \(paths.count) items to the Trash?"
+            alert.informativeText = "Folders and files in the selection move together. You can put them back from the Trash until you empty it."
+        }
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        trashingSelection = true
+        Task {
+            let failed = await Task.detached(priority: .userInitiated) { () -> [String] in
+                var failed: [String] = []
+                for path in paths {
+                    do {
+                        _ = try Trash.move(path)
+                    } catch {
+                        failed.append("\((path as NSString).lastPathComponent): \(error.localizedDescription)")
+                    }
+                }
+                return failed
+            }.value
+            trashingSelection = false
+            if failed.count < paths.count {
+                selectionFromList = true
+                listSelection = []
+                selection = nil
+                selectionFromList = false
+                startScan()
+            }
+            if !failed.isEmpty {
+                let err = NSAlert()
+                err.messageText = failed.count == paths.count ? "Couldn't move to Trash" : "Some items couldn't be moved"
+                err.informativeText = failed.joined(separator: "\n")
+                err.runModal()
+            }
+        }
     }
     var hovered: Int? = nil
     var freeBytes: UInt64 = 0
@@ -262,12 +389,15 @@ final class ScanModel {
     private var volumeTask: Task<VolumeSpace, Never>?
 
     func startScan(path: String? = nil) {
-        if scanning || cleanupTrash.running { return }
+        if scanning || cleanupTrash.running || trashingSelection { return }
         if let path { scanRoot = path }
         tree = nil
         cleanup = []
         viewRoot = 0
+        selectionFromList = true
+        listSelection = []
         selection = nil
+        selectionFromList = false
         hovered = nil
         files = 0; dirs = 0; bytes = 0; elapsed = 0
         lastPollAt = nil; maxPollGap = 0

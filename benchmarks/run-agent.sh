@@ -21,7 +21,7 @@ for old,new in changes.items():
     source=source.replace(old,new)
 p.write_text(source)
 p=Path(sys.argv[2]); source=p.read_text()
-old='try FileManager.default.trashItem(at: URL(fileURLWithPath: item.path), resultingItemURL: nil)'
+old='_ = try Trash.move(item.path)'
 assert source.count(old)==1, 'Expected one manual-trash operation'
 p.write_text(source.replace(old, 'try AgentBenchmarkTrash.move(item)'))
 p=Path(sys.argv[3]); source=p.read_text()

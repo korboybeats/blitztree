@@ -86,6 +86,9 @@ nonisolated final class Tree: @unchecked Sendable {
     var freeBytes: UInt64 = 0
     var hovered: Int?
     var selection: Int?
+    var listSelection: [Int] = []
+    func selectedPaths() -> [String] { [] }
+    func moveListSelectionToTrash() {}
     var scanRoot = "fixture"
     var agentRun: AgentRun?
 }

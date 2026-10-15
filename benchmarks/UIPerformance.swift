@@ -60,6 +60,60 @@ private func childrenAreUnmaterialized(_ item: OutlinePanel.Item) -> Bool {
     return Mirror(reflecting: kids.value).children.isEmpty
 }
 
+/// Multi-select bookkeeping and which paths a delete actually moves.
+@MainActor private func checkListSelection() {
+    var rows = Fixture()
+    let fileA = rows.add("a", bytes: 30, directory: false)
+    let folder = rows.add("folder")
+    let child = rows.add("child", to: folder, bytes: 10, directory: false)
+    let fileB = rows.add("b", bytes: 20, directory: false)
+    let tree = rows.tree()
+    check(ListSelection.outermost([folder, child], parents: tree.parents) == [folder], "Deleting a folder and its child trashes the child twice")
+    check(ListSelection.outermost([fileA, fileB], parents: tree.parents) == [fileA, fileB], "Unrelated files collapsed to one delete")
+    check(ListSelection.outermost([child], parents: tree.parents) == [child], "A lone file was dropped")
+
+    let model = ScanModel()
+    model.tree = tree
+    model.selection = fileA
+    check(model.listSelection == [fileA], "A map click did not become the list selection")
+    model.replaceListSelection([fileA, fileB], anchor: fileB)
+    check(model.selection == fileB && model.listSelection == [fileA, fileB], "The list could not keep more than one row")
+    model.selection = fileA
+    check(model.listSelection == [fileA], "A later single selection left the old rows selected")
+    model.replaceListSelection([folder, child, fileB], anchor: folder)
+    let paths = model.pathsForTrash()
+    check(paths.count == 2, "Trash paths \(paths)")
+    check(paths.contains { $0.hasSuffix("/folder") } && paths.contains { $0.hasSuffix("/b") }, "Trash paths kept a child or dropped a sibling: \(paths)")
+    check(!paths.contains { $0.hasSuffix("/child") }, "Trash paths included a file inside a selected folder")
+    model.selection = nil
+    check(model.listSelection.isEmpty, "Clearing the selection left rows highlighted")
+
+    let outline = NSOutlineView()
+    outline.allowsMultipleSelection = true
+    let coordinator = OutlinePanel.Coordinator()
+    coordinator.model = model
+    coordinator.outline = outline
+    outline.dataSource = coordinator
+    outline.delegate = coordinator
+    model.tree = tree
+    coordinator.rebuildIfNeeded()
+    func row(_ name: String) -> Int {
+        for index in 0..<outline.numberOfRows {
+            let item = outline.item(atRow: index) as! OutlinePanel.Item
+            if item.tree.name(item.id) == name { return index }
+        }
+        fatalError("missing row \(name)")
+    }
+    outline.selectRowIndexes(IndexSet([row("a"), row("b")]), byExtendingSelection: false)
+    coordinator.outlineViewSelectionDidChange(Notification(name: NSOutlineView.selectionDidChangeNotification, object: outline))
+    check(Set(model.listSelection) == Set([fileA, fileB]), "Outline selection did not record both rows: \(model.listSelection)")
+    model.replaceListSelection([fileA, fileB], anchor: fileA)
+    coordinator.syncSelection()
+    check(outline.numberOfSelectedRows == 2, "Sync collapsed a multi-selection")
+    check(Set((0..<outline.numberOfRows).compactMap { outline.selectedRowIndexes.contains($0) ? (outline.item(atRow: $0) as? OutlinePanel.Item)?.id : nil }) == Set([fileA, fileB]),
+          "Synced rows were not the model selection")
+}
+
 private func milliseconds(_ work: () -> Void) -> Double {
     let start = DispatchTime.now().uptimeNanoseconds
     work()
@@ -194,6 +248,7 @@ struct UIPerformance {
         model.tree = newRows.tree()
         coordinator.rebuildIfNeeded()
         check(coordinator.roots[0] !== renamedRow, "Renamed root reused stale outline identity")
+        checkListSelection()
         print("PASS: cleanup parity; lazy outline children; rescan row reuse, new IDs, expansion, and shape invalidation")
         guard !CommandLine.arguments.contains("--check-only") else { return }
 

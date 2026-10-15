@@ -628,13 +628,16 @@ final class SunburstNSView: NSView {
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        guard let model, let tree = model.tree,
+        guard let model, model.tree != nil,
               case let .segment(i) = hit(convert(event.locationInWindow, from: nil)),
               segments[i].node >= 0
         else { return }
-        model.selection = segments[i].node
+        let node = segments[i].node
+        if !model.listSelection.contains(node) {
+            model.selection = node
+        }
         needsDisplay = true
-        NodeMenu.popUp(path: tree.path(segments[i].node), with: event, for: self)
+        NodeMenu.popUp(model: model, paths: model.selectedPaths(), with: event, for: self)
     }
 }
 

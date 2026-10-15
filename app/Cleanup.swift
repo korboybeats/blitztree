@@ -29,6 +29,20 @@ nonisolated enum Cleanup {
     }
 }
 
+/// One Trash move for the directory list, Clean Up, and the agent.
+///
+/// `trashItem(at:resultingItemURL:)` needs a real out-pointer. The list menu
+/// and Clean Up passed nil and, on the list, `try?` threw the error away.
+/// The file stayed in the last scan, so the delete looked like it did nothing.
+/// The agent path already kept the trashed URL; every caller goes through here.
+enum Trash {
+    nonisolated static func move(_ path: String) throws -> URL? {
+        var trashed: NSURL?
+        try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &trashed)
+        return trashed.map { $0 as URL }
+    }
+}
+
 /// A manual cleanup batch keeps file coordination off the main actor and
 /// prevents repeated clicks from moving the same captured selection twice.
 @Observable
@@ -49,7 +63,7 @@ final class CleanupTrashBatch {
                 var failed: [String] = []
                 for item in items {
                     do {
-                        try FileManager.default.trashItem(at: URL(fileURLWithPath: item.path), resultingItemURL: nil)
+                        _ = try Trash.move(item.path)
                     } catch {
                         failed.append("\(item.display): \(error.localizedDescription)")
                     }

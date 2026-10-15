@@ -898,9 +898,8 @@ final class AgentRun {
             var error: String?
             for path in paths where FileManager.default.fileExists(atPath: path) {
                 do {
-                    var out: NSURL?
-                    try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &out)
-                    if let out { moved.append(out as URL) }
+                    let url = try Trash.move(path)
+                    moved.append(url ?? URL(fileURLWithPath: path))
                 } catch let failure {
                     error = error ?? failure.localizedDescription
                 }

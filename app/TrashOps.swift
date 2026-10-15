@@ -379,23 +379,20 @@ enum TrashAdmin {
         }
         let directory = FileManager.default.temporaryDirectory
         let id = UUID().uuidString
-        let scriptURL = directory.appendingPathComponent("blitztree-trash-\(id).sh")
         let listURL = directory.appendingPathComponent("blitztree-trash-\(id).list")
         let resultURL = directory.appendingPathComponent("blitztree-trash-\(id).out")
         defer {
-            try? FileManager.default.removeItem(at: scriptURL)
             try? FileManager.default.removeItem(at: listURL)
             try? FileManager.default.removeItem(at: resultURL)
         }
         do {
-            try scriptSource.write(to: scriptURL, atomically: true, encoding: .utf8)
             try listData(eligible).write(to: listURL, options: .atomic)
             FileManager.default.createFile(atPath: resultURL.path, contents: Data(),
                                            attributes: [.posixPermissions: 0o644])
         } catch {
             return failed("The administrator authorization failed.")
         }
-        guard let source = appleSource(script: scriptURL.path, list: listURL.path, fallback: fallback,
+        guard let source = appleSource(executable: Bundle.main.executablePath ?? "", list: listURL.path, fallback: fallback,
                                         result: resultURL.path, scanRoot: scanRoot, prompt: prompt) else {
             return failed("The administrator authorization failed.")
         }
@@ -449,12 +446,15 @@ enum TrashAdmin {
         return "\"\(escaped)\""
     }
 
-    nonisolated private static func appleSource(script: String, list: String, fallback: String, result: String,
+    /// Runs this app's own signed executable as root (see `AdminTrash`). A
+    /// shell script run as root is a different program to macOS privacy
+    /// protection: it has no Full Disk Access even when BlitzTree does.
+    nonisolated private static func appleSource(executable script: String, list: String, fallback: String, result: String,
                                                 scanRoot: String, prompt: String) -> String? {
         guard let scriptLit = appleString(script), let listLit = appleString(list),
               let fallbackLit = appleString(fallback), let resultLit = appleString(result),
               let rootLit = appleString(scanRoot), let promptLit = appleString(prompt) else { return nil }
-        return "do shell script \"/bin/bash \" & quoted form of \(scriptLit) & \" \" & quoted form of \(listLit) & \" \" & quoted form of \(fallbackLit) & \" \" & quoted form of \(resultLit) & \" \" & quoted form of \(rootLit) with prompt \(promptLit) with administrator privileges"
+        return "do shell script quoted form of \(scriptLit) & \" \(AdminTrash.flag) \" & quoted form of \(listLit) & \" \" & quoted form of \(fallbackLit) & \" \" & quoted form of \(resultLit) & \" \" & quoted form of \(rootLit) with prompt \(promptLit) with administrator privileges"
     }
 
     nonisolated private static func listData(_ items: [TrashFailure]) -> Data {
@@ -493,249 +493,6 @@ enum TrashAdmin {
     }
 
 
-    nonisolated static let scriptSource = #"""
-#!/bin/bash
-# Privileged delete/move. Invoked as root via `do shell script ... with
-# administrator privileges`. Paths arrive only as NUL records in $1; this
-# file never interpolates them into a shell command line.
-# Records: mode \0 path \0 dest \0
-# Results: status \0 path \0 destination \0   (destination empty when removed)
-set -u
-list="$1"
-fallback="$2"
-result="$3"
-scanroot="${4:-}"
-
-: > "$result"
-
-write_result() {
-  # $1 status, $2 path, $3 destination or message
-  printf '%s\0%s\0%s\0' "$1" "$2" "$3" >> "$result"
-}
-
-# Root still gets EPERM ("Operation not permitted") from macOS privacy
-# protection when the app has no Full Disk Access; report that by name.
-why() {
-  case "$1" in
-    *"Operation not permitted"*) printf '%s' "privacy" ;;
-    *) printf '%s' "$2" ;;
-  esac
-}
-
-refuse() {
-  case "$1" in
-    ""|/|.)
-      return 0 ;;
-    /System|/System/Volumes|/System/Volumes/Data|/usr|/bin|/sbin|/private|/dev|/etc|/var|/opt|/Library|/System/Library|/Applications|/Users|/Volumes)
-      return 0 ;;
-    /private/etc|/private/var|/private/tmp)
-      return 0 ;;
-    /System/Volumes/Data/Users|/System/Volumes/Data/Applications|/System/Volumes/Data/Library|/System/Volumes/Data/opt|/System/Volumes/Data/private)
-      return 0 ;;
-  esac
-  case "$1" in
-    /*) ;;
-    *) return 0 ;;
-  esac
-  case "$1" in
-    /Users/*)
-      rest="${1#/Users/}"
-      case "$rest" in
-        */*) ;;
-        *) return 0 ;;
-      esac
-      ;;
-    /System/Volumes/Data/Users/*)
-      rest="${1#/System/Volumes/Data/Users/}"
-      case "$rest" in
-        */*) ;;
-        *) return 0 ;;
-      esac
-      ;;
-  esac
-  if [ -n "$scanroot" ] && [ "$1" = "$scanroot" ]; then
-    return 0
-  fi
-  return 1
-}
-
-already_trash() {
-  local p="$1" home_trash="$2" rest user vol uid
-  case "$p" in
-    /Users/*)
-      rest="${p#/Users/}"
-      user="${rest%%/*}"
-      rest="${rest#"$user"}"
-      case "$rest" in
-        /.Trash|/.Trash/*) return 0 ;;
-      esac
-      ;;
-    /System/Volumes/Data/Users/*)
-      rest="${p#/System/Volumes/Data/Users/}"
-      user="${rest%%/*}"
-      rest="${rest#"$user"}"
-      case "$rest" in
-        /.Trash|/.Trash/*) return 0 ;;
-      esac
-      ;;
-  esac
-  case "$p" in
-    /Volumes/*/*)
-      rest="${p#/Volumes/}"
-      vol="${rest%%/*}"
-      rest="${rest#"$vol"/}"
-      case "$rest" in
-        .Trashes/*) ;;
-        *) rest="" ;;
-      esac
-      if [ -n "$rest" ]; then
-        rest="${rest#.Trashes/}"
-        uid="${rest%%/*}"
-        case "$uid" in
-          ""|*[!0-9]*) ;;
-          *) return 0 ;;
-        esac
-      fi
-      ;;
-  esac
-  if [ -n "$home_trash" ]; then
-    case "$p" in
-      "$home_trash"|"$home_trash"/*) return 0 ;;
-    esac
-  fi
-  return 1
-}
-
-owner_trash() {
-  local p="$1" hint="$2" rest user vol uid
-  case "$p" in
-    /System/Volumes/Data/Users/*/*)
-      rest="${p#/System/Volumes/Data/Users/}"
-      user="${rest%%/*}"
-      printf '%s' "/System/Volumes/Data/Users/$user/.Trash"
-      return
-      ;;
-    /Users/*/*)
-      rest="${p#/Users/}"
-      user="${rest%%/*}"
-      printf '%s' "/Users/$user/.Trash"
-      return
-      ;;
-    /Volumes/*/*)
-      rest="${p#/Volumes/}"
-      vol="${rest%%/*}"
-      if [ -e "$p" ]; then
-        uid=$(/usr/bin/stat -f '%u' "$p" 2>/dev/null) || uid=""
-      else
-        uid=""
-      fi
-      if [ -n "$uid" ]; then
-        printf '%s' "/Volumes/$vol/.Trashes/$uid"
-        return
-      fi
-      ;;
-  esac
-  printf '%s' "$hint"
-}
-
-unique_dest() {
-  local dir="$1" base="$2" stem ext n dest
-  case "$base" in
-    .*|*.*)
-      case "$base" in
-        .*) stem="$base"; ext="" ;;
-        *) ext=".${base##*.}"; stem="${base%.*}" ;;
-      esac
-      ;;
-    *) stem="$base"; ext="" ;;
-  esac
-  dest="$dir/$base"
-  if [ ! -e "$dest" ]; then
-    printf '%s' "$dest"
-    return 0
-  fi
-  n=2
-  while [ -e "$dir/$stem $n$ext" ]; do
-    n=$((n + 1))
-    if [ "$n" -gt 999 ]; then
-      return 1
-    fi
-  done
-  printf '%s' "$dir/$stem $n$ext"
-}
-
-process_one() {
-  local mode="$1" path="$2" hint="$3" target base dest_file uid gid
-  if refuse "$path"; then
-    write_result fail "$path" "refused"
-    return
-  fi
-  if already_trash "$path" "$fallback"; then
-    mode="rm"
-  fi
-  case "$mode" in
-    rm)
-      if ! already_trash "$path" "$fallback"; then
-        write_result fail "$path" "refused"
-        return
-      fi
-      if err=$(/bin/rm -rf -- "$path" 2>&1); then
-        write_result ok "$path" ""
-      else
-        write_result fail "$path" "$(why "$err" "couldn't delete")"
-      fi
-      ;;
-    mv)
-      if [ -z "$hint" ]; then
-        hint="$fallback"
-      fi
-      target=$(owner_trash "$path" "$hint")
-      if [ -z "$target" ] || refuse "$target"; then
-        write_result fail "$path" "no trash folder"
-        return
-      fi
-      if [ ! -d "$target" ]; then
-        if ! /bin/mkdir -p -- "$target"; then
-          write_result fail "$path" "couldn't create trash"
-          return
-        fi
-        # A trash folder we just created should belong to the home's owner,
-        # not root, so that person can put the file back.
-        if [ -d "${target%/*}" ]; then
-          uid=$(/usr/bin/stat -f '%u' "${target%/*}" 2>/dev/null) || uid=""
-          gid=$(/usr/bin/stat -f '%g' "${target%/*}" 2>/dev/null) || gid=""
-          if [ -n "$uid" ] && [ -n "$gid" ]; then
-            /usr/sbin/chown "$uid:$gid" "$target" 2>/dev/null || true
-          fi
-          /bin/chmod 700 "$target" 2>/dev/null || true
-        fi
-      fi
-      base="${path##*/}"
-      if [ -z "$base" ] || [ "$base" = "/" ] || [ "$base" = "." ] || [ "$base" = ".." ]; then
-        write_result fail "$path" "refused"
-        return
-      fi
-      dest_file=$(unique_dest "$target" "$base") || {
-        write_result fail "$path" "name in use"
-        return
-      }
-      if err=$(/bin/mv -- "$path" "$dest_file" 2>&1); then
-        write_result ok "$path" "$dest_file"
-      else
-        write_result fail "$path" "$(why "$err" "couldn't move to trash")"
-      fi
-      ;;
-    *)
-      write_result fail "$path" "refused"
-      ;;
-  esac
-}
-
-while IFS= read -r -d '' mode && IFS= read -r -d '' path && IFS= read -r -d '' hint; do
-  process_one "$mode" "$path" "$hint"
-done < "$list"
-exit 0
-"""#
 }
 
 @MainActor
@@ -851,5 +608,115 @@ enum TrashUI {
         scroll.borderType = .bezelBorder
         scroll.documentView = view
         return scroll
+    }
+}
+
+/// Headless administrator mode: `BlitzTree --bz-admin-trash <list> <fallback>
+/// <result> <scanRoot>`, started as root by `TrashAdmin`. Records in <list>
+/// are NUL-terminated `mode, path, hint`; results are NUL-terminated
+/// `status, path, destination-or-reason` (destination empty when removed).
+/// Paths never touch a shell. Same refusals as the app itself.
+nonisolated enum AdminTrash {
+    static let flag = "--bz-admin-trash"
+
+    static func runIfRequested() {
+        let args = CommandLine.arguments
+        guard args.count >= 2, args[1] == flag else { return }
+        guard args.count >= 5 else { exit(2) }
+        exit(run(list: args[2], fallback: args[3], result: args[4], scanRoot: args.count > 5 ? args[5] : ""))
+    }
+
+    static func run(list: String, fallback: String, result: String, scanRoot: String) -> Int32 {
+        guard let data = FileManager.default.contents(atPath: list) else { return 1 }
+        var fields = data.split(separator: 0, omittingEmptySubsequences: false).map { String(decoding: $0, as: UTF8.self) }
+        if fields.last == "" { fields.removeLast() }
+        var out = Data()
+        func write(_ status: String, _ path: String, _ extra: String) {
+            for f in [status, path, extra] { out.append(contentsOf: f.utf8); out.append(0) }
+        }
+        var i = 0
+        while i + 2 < fields.count {
+            let (mode, path, hint) = (fields[i], fields[i + 1], fields[i + 2])
+            i += 3
+            let r = process(mode: mode, path: path, hint: hint, fallback: fallback, scanRoot: scanRoot)
+            write(r.0, path, r.1)
+        }
+        return FileManager.default.createFile(atPath: result, contents: out) ? 0 : 1
+    }
+
+    static func refused(_ path: String, scanRoot: String) -> Bool {
+        guard path.hasPrefix("/"), !path.contains("/../"), !path.hasSuffix("/..") else { return true }
+        return TrashSafety.isBlocked(path, scanRoot: scanRoot)
+    }
+
+    static func inTrash(_ path: String, fallback: String) -> Bool {
+        if TrashPlace.contains(path) { return true }
+        guard !fallback.isEmpty else { return false }
+        return path == fallback || path.hasPrefix(fallback + "/")
+    }
+
+    private static func reason(_ error: Error, _ fallback: String) -> String {
+        var e: NSError? = error as NSError
+        while let n = e {
+            if (n.domain == NSPOSIXErrorDomain && n.code == Int(EPERM)) { return "privacy" }
+            e = n.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return fallback
+    }
+
+    static func ownerTrash(_ path: String, hint: String) -> String {
+        let parts = TrashPaths.components(path)
+        if parts.count >= 6, Array(parts[0..<4]) == ["System", "Volumes", "Data", "Users"] {
+            return "/System/Volumes/Data/Users/\(parts[4])/.Trash"
+        }
+        if parts.count >= 3, parts[0] == "Users" { return "/Users/\(parts[1])/.Trash" }
+        if parts.count >= 3, parts[0] == "Volumes",
+           let uid = (try? FileManager.default.attributesOfItem(atPath: path))?[.ownerAccountID] as? NSNumber {
+            return "/Volumes/\(parts[1])/.Trashes/\(uid)"
+        }
+        return hint
+    }
+
+    static func uniqueDest(_ dir: String, _ base: String) -> String? {
+        let fm = FileManager.default
+        let first = dir + "/" + base
+        if !fm.fileExists(atPath: first) { return first }
+        let ext = (base.hasPrefix(".") || !base.contains(".")) ? "" : "." + (base as NSString).pathExtension
+        let stem = ext.isEmpty ? base : String(base.dropLast(ext.count))
+        for n in 2...999 where !fm.fileExists(atPath: "\(dir)/\(stem) \(n)\(ext)") {
+            return "\(dir)/\(stem) \(n)\(ext)"
+        }
+        return nil
+    }
+
+    static func process(mode: String, path: String, hint: String, fallback: String, scanRoot: String) -> (String, String) {
+        let fm = FileManager.default
+        if refused(path, scanRoot: scanRoot) { return ("fail", "refused") }
+        if inTrash(path, fallback: fallback) || mode == "rm" {
+            guard inTrash(path, fallback: fallback) else { return ("fail", "refused") }
+            do { try fm.removeItem(atPath: path); return ("ok", "") }
+            catch { return ("fail", reason(error, "couldn't delete")) }
+        }
+        guard mode == "mv" else { return ("fail", "refused") }
+        let target = ownerTrash(path, hint: hint.isEmpty ? fallback : hint)
+        if target.isEmpty || refused(target, scanRoot: "") { return ("fail", "no trash folder") }
+        var isDir: ObjCBool = false
+        if !fm.fileExists(atPath: target, isDirectory: &isDir) {
+            do {
+                // Owned by the home's owner, so that person can put files back.
+                let parent = (target as NSString).deletingLastPathComponent
+                let attrs = try? fm.attributesOfItem(atPath: parent)
+                try fm.createDirectory(atPath: target, withIntermediateDirectories: true,
+                                       attributes: [.posixPermissions: 0o700])
+                if let uid = attrs?[.ownerAccountID], let gid = attrs?[.groupOwnerAccountID] {
+                    try? fm.setAttributes([.ownerAccountID: uid, .groupOwnerAccountID: gid], ofItemAtPath: target)
+                }
+            } catch { return ("fail", reason(error, "couldn't create trash")) }
+        }
+        let base = (path as NSString).lastPathComponent
+        guard !base.isEmpty, base != "/", base != ".", base != ".." else { return ("fail", "refused") }
+        guard let dest = uniqueDest(target, base) else { return ("fail", "name in use") }
+        do { try fm.moveItem(atPath: path, toPath: dest); return ("ok", dest) }
+        catch { return ("fail", reason(error, "couldn't move to trash")) }
     }
 }

@@ -514,6 +514,20 @@ struct OutlinePanel: NSViewRepresentable {
             self.id = id
             self.tree = tree
         }
+
+        /// Follow an in-place edit of the same scan: keep this row (and its
+        /// expansion) and every child row that survived, by node id.
+        /// Returns the rows whose child lists changed, for a targeted reload.
+        func adopt(_ edited: Tree, changed: Set<Int>, into reloaded: inout [Item]) {
+            tree = edited
+            guard let old = kids else { return }
+            if changed.contains(id) {
+                let byID = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                kids = edited.children(id).map { byID[Int($0)] ?? Item(id: Int($0), tree: edited) }
+                reloaded.append(self)
+            }
+            for kid in kids ?? [] { kid.adopt(edited, changed: changed, into: &reloaded) }
+        }
     }
 
     @MainActor
@@ -530,6 +544,11 @@ struct OutlinePanel: NSViewRepresentable {
 
         func rebuildIfNeeded() {
             guard let model, let t = model.tree else { return }
+            if let old = tree, t !== old, let edit = t.edit, t.origin == old.origin,
+               model.viewRoot == viewRoot, let outline {
+                applyEdit(t, edit: edit, outline: outline)
+                return
+            }
             if t !== tree || model.viewRoot != viewRoot {
                 let childIDs = t.children(model.viewRoot)
                 // Bound name comparisons for extremely wide directories.
@@ -567,6 +586,39 @@ struct OutlinePanel: NSViewRepresentable {
                     NSLog("BZ list reload: %.1f ms", -started.timeIntervalSinceNow * 1000)
                 }
             }
+        }
+
+        /// A delete edited the scan in place: drop the deleted rows and
+        /// refresh sizes without reloading the list, so expanded folders and
+        /// the scroll position stay where they were.
+        private func applyEdit(_ t: Tree, edit: TreeEditInfo, outline: NSOutlineView) {
+            tree = t
+            var reloaded: [Item] = []
+            let rootChanged = edit.changedParents.contains(viewRoot)
+            if rootChanged {
+                let byID = Dictionary(roots.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                roots = t.children(viewRoot).map { byID[Int($0)] ?? Item(id: Int($0), tree: t) }
+            }
+            for item in roots { item.adopt(t, changed: edit.changedParents, into: &reloaded) }
+            syncing = true
+            if rootChanged {
+                outline.reloadItem(nil, reloadChildren: true)
+            } else {
+                for item in reloaded where outline.row(forItem: item) >= 0 || outline.isItemExpanded(item) {
+                    outline.reloadItem(item, reloadChildren: true)
+                }
+            }
+            // Sizes and percentages changed up every ancestor: refresh the
+            // visible cells only.
+            outline.enumerateAvailableRowViews { rowView, row in
+                guard let item = outline.item(atRow: row) as? Item else { return }
+                for (column, definition) in outline.tableColumns.enumerated() {
+                    if let cell = rowView.view(atColumn: column) as? NSTableCellView {
+                        self.configure(cell, column: definition.identifier.rawValue, item: item)
+                    }
+                }
+            }
+            syncing = false
         }
 
         func icon(for name: String, isDir: Bool) -> NSImage {

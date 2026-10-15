@@ -228,16 +228,17 @@ nonisolated enum TypeColor {
         }
 
         mutating func color(_ tree: Tree, _ node: Int) -> RGB {
-            let start = Int(tree.nameOff[node]), end = Int(tree.nameOff[node + 1])
+            let name = tree.nameBytes(node)
+            let start = 0, end = name.count
             var dot = end - 1
-            while dot > start, tree.nameBlob[dot] != UInt8(ascii: ".") { dot -= 1 }
+            while dot > start, name[dot] != UInt8(ascii: ".") { dot -= 1 }
             // No extension, or a dotfile with nothing before the dot.
             guard dot > start else { return TypeColor.plain }
             let len = end - dot - 1
             guard len > 0, len <= 16 else { return TypeColor.forName(tree.name(node)) }
             var key = Key(a: 0, b: 0)
             for i in (dot + 1)..<end {
-                var b = tree.nameBlob[i]
+                var b = name[i]
                 if b >= 65, b <= 90 { b += 32 } // ASCII lowercase
                 if i - dot <= 8 { key.a = key.a << 8 | UInt64(b) } else { key.b = key.b << 8 | UInt64(b) }
             }

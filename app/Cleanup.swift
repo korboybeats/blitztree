@@ -18,8 +18,10 @@ nonisolated enum Cleanup {
     /// Swift only supplies presentation paths; rules and labels live in cleanup.rs.
     static func find(in tree: Tree) -> [CleanupItem] {
         let home = NSHomeDirectory()
-        return (0..<tree.cleanupCount).map { index in
+        return (0..<tree.cleanupCount).compactMap { index in
             let node = Int(tree.cleanupNodes[index])
+            // Gone after an in-place delete (it, or a folder above it).
+            if tree.edit != nil && !TreeEdit.isLive(node, in: tree) { return nil }
             let path = tree.path(node)
             var display = tree.displayPath(node)
             if display.hasPrefix(home) { display = "~" + display.dropFirst(home.count) }
@@ -55,14 +57,17 @@ final class CleanupTrashBatch {
     func clearFailures() { failures = [] }
 
     @discardableResult
-    func start(_ items: [CleanupItem], scanRoot: String = "", completion: @escaping ([String]) -> Void) -> Task<Void, Never>? {
+    /// `completion` gets the failure lines and where each moved item went.
+    func start(_ items: [CleanupItem], scanRoot: String = "",
+               completion: @escaping (_ failed: [String], _ moved: [String: String]) async -> Void) -> Task<Void, Never>? {
         guard !running else { return nil }
         running = true
         let root = scanRoot
         return Task {
-            let outcome = await Task.detached(priority: .userInitiated) { () -> (failed: [TrashFailure], ok: Int) in
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (failed: [TrashFailure], ok: Int, moved: [String: String]) in
                 var failed: [TrashFailure] = []
                 var ok = 0
+                var moved: [String: String] = [:]
                 for item in items {
                     let inTrash = TrashPlace.contains(item.path)
                     do {
@@ -71,8 +76,8 @@ final class CleanupTrashBatch {
                         }
                         if inTrash {
                             try Trash.removeNow(item.path, scanRoot: root)
-                        } else {
-                            _ = try Trash.move(item.path)
+                        } else if let url = try Trash.move(item.path) {
+                            moved[item.path] = url.path
                         }
                         ok += 1
                     } catch {
@@ -82,7 +87,7 @@ final class CleanupTrashBatch {
                             permission: TrashError.isPermission(ns), inTrash: inTrash, bytes: item.bytes))
                     }
                 }
-                return (failed, ok)
+                return (failed, ok, moved)
             }.value
             // Permission errors share one administrator prompt. Anything else
             // keeps the per-item line the offline benchmark checks.
@@ -90,7 +95,7 @@ final class CleanupTrashBatch {
             let strings = settled.failed.map { "\($0.label): \($0.message)" }
             failures.append(contentsOf: strings)
             running = false
-            completion(strings)
+            await completion(strings, outcome.moved.merging(settled.moved) { a, _ in a })
         }
     }
 }
@@ -317,10 +322,10 @@ struct CleanupPanel: View {
     private func trashPicked() {
         let items = actionable
         guard !items.isEmpty else { return }
-        model.cleanupTrash.start(items, scanRoot: model.scanRoot) { failed in
+        model.cleanupTrash.start(items, scanRoot: model.scanRoot) { failed, moved in
             picked = []
-            // The batch clears its busy state before this final rescan.
-            model.startScan()
+            // Update the scan in place: no full rescan, the view stays put.
+            await model.applyDiskChanges(paths: items.map(\.path), moves: moved)
             if !failed.isEmpty {
                 TrashUI.present(lines: failed)
                 model.cleanupTrash.clearFailures()

@@ -122,6 +122,90 @@ private func milliseconds(_ work: () -> Void) -> Double {
 
 private func median(_ samples: [Double]) -> Double { samples.sorted()[samples.count / 2] }
 
+/// Deletes edit the scan in place: sizes up every ancestor, removed nodes
+/// unreachable, ids stable, moves into a Trash inside the scan re-homed,
+/// and the folder on screen, expanded rows, and selection kept.
+@MainActor private func checkIncrementalEdit() {
+    var rows = Fixture()
+    let docs = rows.add("docs")
+    let deep = rows.add("deep", to: docs)
+    let x = rows.add("x", to: deep, bytes: 100, directory: false)
+    let y = rows.add("y", to: deep, bytes: 40, directory: false)
+    let z = rows.add("z", to: deep, bytes: 10, directory: false)
+    let big = rows.add("big", bytes: 120, directory: false)
+    let trash = rows.add(".Trash")
+    rows.add("old", to: trash, bytes: 5, directory: false)
+    let tree = rows.tree()
+    let total = tree.alloc[0]
+    check(total == 275, "fixture total \(total)")
+
+    // Remove a file: every ancestor shrinks, ids stay put.
+    let removed = TreeEdit.apply([.remove(x)], to: tree)
+    check(removed.isRemoved(x) && !TreeEdit.isLive(x, in: removed), "Removed node still live")
+    check(removed.alloc[deep] == 50 && removed.alloc[docs] == 50 && removed.alloc[0] == 175, "Ancestor sizes not reduced")
+    check(removed.children(deep).map(Int.init) == [y, z], "Removed node still listed: \(Array(removed.children(deep)))")
+    check(removed.name(y) == "y" && removed.path(z) == "/fixture/docs/deep/z", "Ids or names shifted")
+    check(removed.children(0).map(Int.init) == [big, docs, trash] && tree.children(0).map(Int.init) == [docs, big, trash], "Root children not re-sorted by new size")
+
+    // Remove a folder: its whole subtree goes.
+    let noDocs = TreeEdit.apply([.remove(docs)], to: removed)
+    check(!TreeEdit.isLive(y, in: noDocs) && noDocs.alloc[0] == 125, "Folder delete left its subtree or size")
+
+    // Move into a Trash inside the scan, renamed: total unchanged.
+    let moved = TreeEdit.apply([.move(big, to: trash, name: "big 2")], to: tree)
+    check(moved.alloc[0] == total && moved.alloc[trash] == 125, "Move into Trash changed the total or missed the Trash")
+    check(moved.path(big) == "/fixture/.Trash/big 2", "Moved node path \(moved.path(big))")
+    check(!moved.children(0).contains(UInt32(big)), "Moved node still under its old folder")
+
+    // Graft a rescanned folder in place of an old one.
+    var fresh = Fixture()
+    let inner = fresh.add("inner")
+    fresh.add("new-file", to: inner, bytes: 7, directory: false)
+    let graft = fresh.tree()
+    let replaced = TreeEdit.apply([.replace(deep, with: graft)], to: tree)
+    check(replaced.alloc[deep] == 7 && replaced.alloc[docs] == 7 && replaced.alloc[0] == 132, "Graft sizes wrong")
+    check(!TreeEdit.isLive(x, in: replaced) && replaced.children(deep).count == 1, "Graft kept old children")
+    let innerID = Int(replaced.children(deep)[0])
+    check(replaced.path(Int(replaced.children(innerID)[0])) == "/fixture/docs/deep/inner/new-file", "Grafted names wrong")
+    // A second edit keeps names added by the first.
+    let again = TreeEdit.apply([.remove(big)], to: replaced)
+    check(again.name(innerID) == "inner" && again.alloc[0] == 12, "Second edit lost grafted names or sizes")
+
+    // Disk check: "/fixture/…" does not exist, so these read as deleted.
+    let viaDisk = DiskChanges.edit(tree, paths: ["/fixture/docs/deep/x", "/fixture/big"],
+                                   moves: ["/fixture/big": "/fixture/.Trash/big"], refresh: [])!
+    check(!TreeEdit.isLive(x, in: viaDisk) && viaDisk.parents[big] == UInt32(trash) && viaDisk.alloc[0] == 175,
+          "Disk changes were not applied in place")
+
+    // Model and outline state survive the edit.
+    let model = ScanModel()
+    model.tree = tree
+    model.viewRoot = docs
+    model.replaceListSelection([x], anchor: x)
+    let outline = NSOutlineView()
+    outline.allowsMultipleSelection = true
+    let coordinator = OutlinePanel.Coordinator()
+    coordinator.model = model
+    coordinator.outline = outline
+    outline.dataSource = coordinator
+    outline.delegate = coordinator
+    coordinator.rebuildIfNeeded()
+    let deepRow = coordinator.roots.first { $0.id == deep }!
+    outline.expandItem(deepRow)
+    coordinator.syncSelection()
+    check(outline.numberOfRows == 4, "Fixture outline rows \(outline.numberOfRows)")
+    let edited = TreeEdit.apply([.remove(x)], to: tree)
+    model.install(edited, from: tree, selectionBefore: model.listSelection)
+    coordinator.rebuildIfNeeded()
+    coordinator.syncSelection()
+    check(model.viewRoot == docs, "Edit reset the zoomed folder")
+    check(model.listSelection == [y] && model.selection == y, "Selection did not move to the next row: \(model.listSelection)")
+    check(coordinator.roots.first === deepRow && outline.isItemExpanded(deepRow), "Edit collapsed or replaced an expanded row")
+    check(outline.numberOfRows == 3, "Deleted row still in the outline")
+    check((outline.item(atRow: outline.selectedRow) as? OutlinePanel.Item)?.id == y, "Outline did not select the next row")
+    check(!model.scanning && model.tree === edited, "Edit started a scan")
+}
+
 @main
 struct UIPerformance {
     @MainActor
@@ -249,8 +333,22 @@ struct UIPerformance {
         coordinator.rebuildIfNeeded()
         check(coordinator.roots[0] !== renamedRow, "Renamed root reused stale outline identity")
         checkListSelection()
-        print("PASS: cleanup parity; lazy outline children; rescan row reuse, new IDs, expansion, and shape invalidation")
+        checkIncrementalEdit()
+        print("PASS: incremental delete edits (sizes, removal, moves, grafts, kept view state); cleanup parity; lazy outline children; rescan row reuse, new IDs, expansion, and shape invalidation")
         guard !CommandLine.arguments.contains("--check-only") else { return }
+
+        // In-place delete on a large tree: one O(n) copy-on-write pass, off-main in the app.
+        do {
+            var big = Fixture()
+            for d in 0..<1_000 {
+                let dir = big.add("dir-\(d)")
+                for f in 0..<1_000 { big.add("f\(f)", to: dir, bytes: UInt64(f + 1), directory: false) }
+            }
+            let bigTree = big.tree()
+            let victims = (0..<100).map { Int(bigTree.children(Int(bigTree.children(0)[$0]))[0]) }
+            let samples = (0..<5).map { _ in milliseconds { _ = TreeEdit.apply(victims.map { .remove($0) }, to: bigTree) } }
+            print(String(format: "in-place delete: 100 files from %d nodes median_ms=%.2f", bigTree.count, median(samples)))
+        }
 
         let hasFDA = FDA.isActive()
         let fdaSamples = (0..<31).map { _ in milliseconds { check(FDA.isActive() == hasFDA, "FDA access changed during benchmark") } }

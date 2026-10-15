@@ -606,11 +606,14 @@ final class AgentRun {
     private var process: Process?
     private let scanRoot: String
     private let tree: Tree
-    private let onFinish: () -> Void
+    /// After each step: paths that were deleted or moved, and paths to
+    /// rescan (cleanup commands change caches in place). The model edits the
+    /// scan in place instead of rescanning it.
+    private let onFinish: (_ changed: [String], _ refresh: [String]) -> Void
     private var preparationTask: Task<Void, Never>?
 
     init(agent: InstalledAgent, env: AgentEnvironment, tree: Tree, scanRoot: String,
-         known: [CleanupItem], onFinish: @escaping () -> Void) {
+         known: [CleanupItem], onFinish: @escaping (_ changed: [String], _ refresh: [String]) -> Void) {
         self.agent = agent
         self.scanRoot = scanRoot
         self.tree = tree
@@ -635,9 +638,10 @@ final class AgentRun {
 
     /// Folders to light up on the treemap: what the plan would remove.
     func highlights(in shown: Tree?) -> [Int] {
-        guard shown === tree, phase != .done else { return [] }
+        // An in-place edit keeps node ids, so the plan still lines up.
+        guard let shown, shown.origin == tree.origin, phase != .done else { return [] }
         return items.filter { $0.selected && $0.blocked == nil && $0.status != .done }
-            .flatMap(\.nodes)
+            .flatMap(\.nodes).filter { TreeEdit.isLive($0, in: shown) }
     }
 
     /// What step one moves to the Trash (tool caches wait for step two).
@@ -883,6 +887,12 @@ final class AgentRun {
                 }
             }
             withAnimation(.snappy) { phase = .staged }
+            if !dryRun {
+                // Moved into the Trash: gone from where they were, and if
+                // that Trash is inside the scan, they appear there.
+                let moved = work.flatMap { item in item.paths.filter { !TrashPlace.contains($0) } }
+                onFinish(moved, work.flatMap { $0.trashed.map(\.path) })
+            }
         }
     }
 
@@ -894,6 +904,7 @@ final class AgentRun {
         phase = .deleting
         let work = targets.filter { $0.status == .inTrash || ($0.isCommand && $0.status == .waiting) }
         for item in work { item.status = .running }
+        let removedPaths = work.flatMap { $0.trashed.map(\.path) }
         let before = Self.freeBytes()
         let root = scanRoot
         let sink = TrashPermissionSink()
@@ -964,7 +975,9 @@ final class AgentRun {
                 reclaimed = last > before ? last - before : 0
             }
             withAnimation(.snappy) { phase = .done }
-            if !dryRun { onFinish() }
+            if !dryRun {
+                onFinish(removedPaths, work.filter(\.isCommand).flatMap(\.paths))
+            }
         }
     }
 

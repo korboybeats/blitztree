@@ -503,14 +503,15 @@ enum TrashRetry {
     ///
     /// A path behind macOS privacy protection is not retried: root is denied
     /// too, so the password would be asked for and then fail anyway.
-    static func settle(_ raw: [TrashFailure], succeeded: Int, scanRoot: String) async -> (failed: [TrashFailure], succeeded: Int) {
+    /// `moved` maps each path the administrator retry moved to where it went.
+    static func settle(_ raw: [TrashFailure], succeeded: Int, scanRoot: String) async -> (failed: [TrashFailure], succeeded: Int, moved: [String: String]) {
         let failed = await Task.detached(priority: .userInitiated) {
             raw.map { $0.permission && TrashAccess.privacyBlocked($0.path) ? $0.blockedByPrivacy() : $0 }
         }.value
         let eligible = failed.filter { $0.permission && TrashSafety.allows($0.path, scanRoot: scanRoot) }
-        guard !eligible.isEmpty else { return (failed, succeeded) }
+        guard !eligible.isEmpty else { return (failed, succeeded, [:]) }
         let outcome = await TrashAdmin.retry(eligible, scanRoot: scanRoot)
-        if outcome.cancelled { return (failed, succeeded) }
+        if outcome.cancelled { return (failed, succeeded, [:]) }
         let done = outcome.removed.union(outcome.moved.keys)
         let updates = Dictionary(outcome.failures.map { ($0.path, $0) }, uniquingKeysWith: { first, _ in first })
         var kept: [TrashFailure] = []
@@ -518,7 +519,7 @@ enum TrashRetry {
             if done.contains(item.path) { continue }
             kept.append(updates[item.path] ?? item)
         }
-        return (kept, succeeded + done.count)
+        return (kept, succeeded + done.count, outcome.moved)
     }
 }
 

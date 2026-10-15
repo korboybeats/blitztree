@@ -48,13 +48,14 @@ nonisolated final class AgentBenchmarkTrash: @unchecked Sendable {
     static let shared = AgentBenchmarkTrash()
     private let lock = NSLock()
     private var moved: [Int] = []
-    static func move(_ item: CleanupItem) throws {
+    static func move(_ item: CleanupItem) throws -> URL? {
         precondition(!Thread.isMainThread, "Trash work ran on the UI thread")
         shared.lock.lock(); shared.moved.append(item.node); shared.lock.unlock()
         AgentBenchmarkGate.shared.waitIfArmed()
         if item.node == 2 || item.node == 7 {
             throw NSError(domain: "OfflineTrash", code: item.node, userInfo: [NSLocalizedDescriptionKey: "injected failure"])
         }
+        return nil
     }
     var nodes: [Int] { lock.lock(); defer { lock.unlock() }; return moved }
 }
@@ -320,12 +321,12 @@ struct AgentPerformance {
 
         let agent = InstalledAgent(kind: .codex, path: "/offline-do-not-launch", signedIn: true)
         let env = AgentEnvironment()
-        let early = AgentRun(agent: agent, env: env, tree: tree, scanRoot: "/fixture", known: [], onFinish: {})
+        let early = AgentRun(agent: agent, env: env, tree: tree, scanRoot: "/fixture", known: [], onFinish: { _, _ in })
         let earlyTask = early.preparationTask!
         early.cancel(); await earlyTask.value
         check(AgentBenchmarkLaunch.calls == 0, "Cancelled-before-start task launched")
         AgentBenchmarkGate.shared.arm()
-        let during = AgentRun(agent: agent, env: env, tree: tree, scanRoot: "/fixture", known: [], onFinish: {})
+        let during = AgentRun(agent: agent, env: env, tree: tree, scanRoot: "/fixture", known: [], onFinish: { _, _ in })
         let duringTask = during.preparationTask!
         for _ in 0..<1000 {
             if AgentBenchmarkGate.shared.hasEntered { break }
@@ -334,7 +335,7 @@ struct AgentPerformance {
         check(AgentBenchmarkGate.shared.hasEntered, "Detached prompt did not reach test gate")
         during.cancel(); AgentBenchmarkGate.shared.release(); await duringTask.value
         check(AgentBenchmarkLaunch.calls == 0, "Cancelled-during-preparation task launched")
-        let completed = AgentRun(agent: agent, env: env, tree: tree, scanRoot: "/fixture", known: [], onFinish: {})
+        let completed = AgentRun(agent: agent, env: env, tree: tree, scanRoot: "/fixture", known: [], onFinish: { _, _ in })
         let completedTask = completed.preparationTask!
         await completedTask.value
         check(AgentBenchmarkLaunch.calls == 1 && completed.preparationTask == nil, "Uncancelled preparation did not launch exactly once")
@@ -346,7 +347,7 @@ struct AgentPerformance {
         var completions = 0
         var failures: [String] = []
         AgentBenchmarkGate.shared.arm()
-        let trashTask = batch.start(selected) { result in
+        let trashTask = batch.start(selected) { result, _ in
             check(!batch.running, "Busy flag stayed set during rescan callback")
             failures = result
             completions += 1 // Stands in for the panel's one rescan callback.
@@ -355,7 +356,7 @@ struct AgentPerformance {
         check(batch.running, "Busy state was not set synchronously")
         model.openPanelAfterLaunchScan()
         check(model.panelRequests == 0, "Launch panel opened while trash was busy")
-        check(batch.start(selected) { _ in completions += 1 } == nil, "Busy batch accepted duplicate work")
+        check(batch.start(selected) { _, _ in completions += 1 } == nil, "Busy batch accepted duplicate work")
         for _ in 0..<1000 {
             if AgentBenchmarkGate.shared.hasEntered { break }
             try? await Task.sleep(for: .milliseconds(1))
@@ -373,7 +374,7 @@ struct AgentPerformance {
         await Task.yield()
         let retainedFailures = ["item-2: injected failure", "item-7: injected failure"]
         check(model.cleanupTrash.failures == retainedFailures, "Closing the panel lost cleanup failures")
-        let successfulTask = batch.start([CleanupItem(node: 10, path: "/offline/10", display: "item-10", kind: "fixture", bytes: 1)]) { result in
+        let successfulTask = batch.start([CleanupItem(node: 10, path: "/offline/10", display: "item-10", kind: "fixture", bytes: 1)]) { result, _ in
             check(result.isEmpty, "A successful batch inherited an earlier batch's callback failures")
         }!
         await successfulTask.value

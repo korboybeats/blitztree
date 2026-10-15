@@ -24,8 +24,11 @@ struct ContentView: View {
                     // seconds after every scan with the panel open.
                     HStack(spacing: 0) {
                         if showTable {
-                            OutlinePanel(model: model)
-                                .frame(width: listWidth)
+                            VStack(spacing: 0) {
+                                OutlinePanel(model: model)
+                                ListTrashBar(model: model)
+                            }
+                            .frame(width: listWidth)
                             ListDivider(width: $listWidth)
                         }
                         Group {
@@ -146,7 +149,7 @@ struct ContentView: View {
             } label: {
                 Label("Scan", systemImage: "folder")
             }
-            .disabled(model.scanning || model.cleanupTrash.running)
+            .disabled(model.scanning || model.cleanupTrash.running || model.trashingSelection)
             .help("Choose what to scan")
 
             Button {
@@ -154,7 +157,7 @@ struct ContentView: View {
             } label: {
                 Label("Rescan", systemImage: "arrow.clockwise")
             }
-            .disabled(model.scanning || model.cleanupTrash.running)
+            .disabled(model.scanning || model.cleanupTrash.running || model.trashingSelection)
             .help("Rescan")
         }
 
@@ -274,7 +277,7 @@ private struct ScanStatusBar: View {
     var body: some View {
         HStack(spacing: 8) {
             if let tree = model.tree {
-                if let sel = model.hovered ?? model.selection {
+                if let sel = model.hovered ?? (model.listSelection.count > 1 ? nil : model.selection) {
                     Text(tree.displayPath(sel))
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -283,6 +286,9 @@ private struct ScanStatusBar: View {
                     let rootA = max(tree.alloc[model.viewRoot], 1)
                     Text("\(Fmt.size(a)) · \(String(format: "%.1f%%", 100 * Double(a) / Double(rootA)))")
                         .monospacedDigit()
+                } else if model.hovered == nil, model.listSelection.count > 1 {
+                    Text("\(model.listSelection.count) selected")
+                    Spacer()
                 } else {
                     Text("\(Fmt.num(UInt64(tree.nFiles[model.viewRoot]))) files · \(Fmt.size(tree.alloc[model.viewRoot]))")
                     Spacer()
@@ -411,6 +417,71 @@ final class ValueCell: NSTableCellView {
     }
 }
 
+/// Delete for the directory list. The same action as the row menu and the
+/// Delete key: every selected folder and file.
+private struct ListTrashBar: View {
+    let model: ScanModel
+
+    var body: some View {
+        HStack {
+            Button(role: .destructive) {
+                model.moveListSelectionToTrash()
+            } label: {
+                Label(model.trashMenuTitle(), systemImage: "trash")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!model.listSelection.contains { $0 != 0 } || model.scanning || model.trashingSelection || model.cleanupTrash.running)
+            .help(model.listTrashIsPermanent
+                  ? "Delete the selected items permanently. This can't be undone."
+                  : "Move the selected items to the Trash")
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+    }
+}
+
+/// Outline keyboard: select-all and delete stay on the list. A text field
+/// that is first responder never sees these events.
+final class DirectoryOutlineView: NSOutlineView {
+    var onDelete: (() -> Void)?
+    var prepareMenu: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if window?.firstResponder is NSTextView {
+            super.keyDown(with: event)
+            return
+        }
+        let flags = event.modifierFlags.intersection([.command, .shift, .control, .option])
+        // 'A'. Command is the menu equivalent; Control is the other binding.
+        if event.keyCode == 0 && (flags == .command || flags == .control) {
+            selectAll(nil)
+            return
+        }
+        // Delete and Forward Delete. Command-Delete is left to the menu.
+        if (event.keyCode == 51 || event.keyCode == 117) && flags.isSubset(of: .shift) {
+            onDelete?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    /// Click selects one row, Shift extends from the anchor, Command toggles.
+    /// That is NSTableView once `allowsMultipleSelection` is on. Control-click
+    /// is the context menu, as in Finder; a click outside the selection
+    /// selects that row before the menu opens.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        if row >= 0, !selectedRowIndexes.contains(row) {
+            selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        }
+        let enabled = selectedRow >= 0
+        prepareMenu?()
+        self.menu?.items.forEach { if !$0.isSeparatorItem { $0.isEnabled = enabled } }
+        return self.menu
+    }
+}
+
 struct OutlinePanel: NSViewRepresentable {
     let model: ScanModel
 
@@ -443,6 +514,20 @@ struct OutlinePanel: NSViewRepresentable {
             self.id = id
             self.tree = tree
         }
+
+        /// Follow an in-place edit of the same scan: keep this row (and its
+        /// expansion) and every child row that survived, by node id.
+        /// Returns the rows whose child lists changed, for a targeted reload.
+        func adopt(_ edited: Tree, changed: Set<Int>, into reloaded: inout [Item]) {
+            tree = edited
+            guard let old = kids else { return }
+            if changed.contains(id) {
+                let byID = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                kids = edited.children(id).map { byID[Int($0)] ?? Item(id: Int($0), tree: edited) }
+                reloaded.append(self)
+            }
+            for kid in kids ?? [] { kid.adopt(edited, changed: changed, into: &reloaded) }
+        }
     }
 
     @MainActor
@@ -453,9 +538,17 @@ struct OutlinePanel: NSViewRepresentable {
         var roots: [Item] = []
         weak var outline: NSOutlineView?
         private var iconCache: [String: NSImage] = [:]
+        /// Reload and programmatic selection must not be written back as a
+        /// user click, or a rescan would clear a selection the model still holds.
+        private var syncing = false
 
         func rebuildIfNeeded() {
             guard let model, let t = model.tree else { return }
+            if let old = tree, t !== old, let edit = t.edit, t.origin == old.origin,
+               model.viewRoot == viewRoot, let outline {
+                applyEdit(t, edit: edit, outline: outline)
+                return
+            }
             if t !== tree || model.viewRoot != viewRoot {
                 let childIDs = t.children(model.viewRoot)
                 // Bound name comparisons for extremely wide directories.
@@ -472,7 +565,9 @@ struct OutlinePanel: NSViewRepresentable {
                     // A rescan often has the same top-level shape. Keep row
                     // views/disclosure buttons and refresh only their cells.
                     for (item, id) in zip(roots, childIDs) { item.rebind(to: Int(id), in: t) }
+                    syncing = true
                     outline.deselectAll(nil)
+                    syncing = false
                     outline.enumerateAvailableRowViews { rowView, row in
                         guard self.roots.indices.contains(row) else { return }
                         for (column, definition) in outline.tableColumns.enumerated() {
@@ -483,12 +578,47 @@ struct OutlinePanel: NSViewRepresentable {
                     }
                 } else {
                     roots = childIDs.map { Item(id: Int($0), tree: t) }
+                    syncing = true
                     outline?.reloadData()
+                    syncing = false
                 }
                 if ProcessInfo.processInfo.environment["BZ_TIMING"] != nil {
                     NSLog("BZ list reload: %.1f ms", -started.timeIntervalSinceNow * 1000)
                 }
             }
+        }
+
+        /// A delete edited the scan in place: drop the deleted rows and
+        /// refresh sizes without reloading the list, so expanded folders and
+        /// the scroll position stay where they were.
+        private func applyEdit(_ t: Tree, edit: TreeEditInfo, outline: NSOutlineView) {
+            tree = t
+            var reloaded: [Item] = []
+            let rootChanged = edit.changedParents.contains(viewRoot)
+            if rootChanged {
+                let byID = Dictionary(roots.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                roots = t.children(viewRoot).map { byID[Int($0)] ?? Item(id: Int($0), tree: t) }
+            }
+            for item in roots { item.adopt(t, changed: edit.changedParents, into: &reloaded) }
+            syncing = true
+            if rootChanged {
+                outline.reloadItem(nil, reloadChildren: true)
+            } else {
+                for item in reloaded where outline.row(forItem: item) >= 0 || outline.isItemExpanded(item) {
+                    outline.reloadItem(item, reloadChildren: true)
+                }
+            }
+            // Sizes and percentages changed up every ancestor: refresh the
+            // visible cells only.
+            outline.enumerateAvailableRowViews { rowView, row in
+                guard let item = outline.item(atRow: row) as? Item else { return }
+                for (column, definition) in outline.tableColumns.enumerated() {
+                    if let cell = rowView.view(atColumn: column) as? NSTableCellView {
+                        self.configure(cell, column: definition.identifier.rawValue, item: item)
+                    }
+                }
+            }
+            syncing = false
         }
 
         func icon(for name: String, isDir: Bool) -> NSImage {
@@ -592,43 +722,88 @@ struct OutlinePanel: NSViewRepresentable {
 
         func outlineViewSelectionDidChange(_ n: Notification) {
             // While a rescan runs the list still shows the old tree, hidden.
-            guard let outline, let model, model.tree != nil, model.tree === tree else { return }
-            if let it = outline.item(atRow: outline.selectedRow) as? Item {
-                model.selection = it.id
-            }
+            guard !syncing, let outline, let model, model.tree != nil, model.tree === tree else { return }
+            let rows = outline.selectedRowIndexes.sorted()
+            let ids = rows.compactMap { (outline.item(atRow: $0) as? Item)?.id }
+            let anchor = (outline.item(atRow: outline.selectedRow) as? Item)?.id
+            model.replaceListSelection(ids, anchor: anchor)
         }
 
-        /// Treemap click → expand ancestors, select and reveal the row here.
-        func syncSelection() {
-            guard let outline, let tree, let sel = model?.selection else { return }
-            if let cur = outline.item(atRow: outline.selectedRow) as? Item, cur.id == sel { return }
+        private func selectedIDs(_ outline: NSOutlineView) -> [Int] {
+            outline.selectedRowIndexes.sorted().compactMap { (outline.item(atRow: $0) as? Item)?.id }
+        }
 
+        /// Expand ancestors and return the outline item for `id`, or nil when
+        /// it is the view root or outside this folder.
+        private func item(for id: Int, expanding outline: NSOutlineView, tree: Tree) -> Item? {
             var chain: [Int] = []
-            var cur = sel
+            var cur = id
             while cur != viewRoot {
-                if cur == Int(UInt32.max) { return } // outside current view root
+                if cur == Int(UInt32.max) { return nil }
                 chain.append(cur)
                 cur = Int(tree.parents[cur])
             }
             chain.reverse()
-
             var level = roots
             var target: Item?
-            for id in chain {
-                guard let it = level.first(where: { $0.id == id }) else { return }
+            for nodeID in chain {
+                guard let it = level.first(where: { $0.id == nodeID }) else { return nil }
                 target = it
-                if id != chain.last {
+                if nodeID != chain.last {
                     outline.expandItem(it)
                     level = it.children
                 }
             }
-            if let target {
-                let row = outline.row(forItem: target)
-                if row >= 0 {
-                    outline.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+            return target
+        }
+
+        /// Map click → expand ancestors and select those rows here.
+        func syncSelection() {
+            guard let outline, let model, model.tree === self.tree, let tree = self.tree else { return }
+            let wanted = model.listSelection
+            if Set(selectedIDs(outline)) == Set(wanted) { return }
+
+            // Expand first, then read rows. Expanding a folder shifts every
+            // row below it, so indexes taken mid-loop would be stale.
+            let items = wanted.compactMap { item(for: $0, expanding: outline, tree: tree) }
+            let rows = IndexSet(items.compactMap { row in
+                let index = outline.row(forItem: row)
+                return index >= 0 ? index : nil
+            })
+            if rows.isEmpty && outline.numberOfSelectedRows == 0 { return }
+            syncing = true
+            if rows.isEmpty {
+                outline.deselectAll(nil)
+            } else {
+                outline.selectRowIndexes(rows, byExtendingSelection: false)
+                if let anchor = model.selection,
+                   let item = item(for: anchor, expanding: outline, tree: tree) {
+                    let row = outline.row(forItem: item)
+                    if row >= 0 { outline.scrollRowToVisible(row) }
+                } else if let row = rows.last {
                     outline.scrollRowToVisible(row)
                 }
             }
+            syncing = false
+        }
+
+        @objc func revealSelected(_ sender: Any?) {
+            guard let model, let tree = model.tree else { return }
+            let urls = model.listSelection.map { URL(fileURLWithPath: tree.path($0)) }
+            guard !urls.isEmpty else { return }
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
+        }
+
+        @objc func copySelected(_ sender: Any?) {
+            guard let model, let tree = model.tree else { return }
+            let text = model.listSelection.map { tree.path($0) }.joined(separator: "\n")
+            guard !text.isEmpty else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+        }
+
+        @objc func deleteSelected(_ sender: Any?) {
+            model?.moveListSelectionToTrash()
         }
 
         @objc func doubleClicked(_ sender: NSOutlineView) {
@@ -645,10 +820,16 @@ struct OutlinePanel: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let outline = NSOutlineView()
+        let outline = DirectoryOutlineView()
         outline.style = .plain
         outline.rowSizeStyle = .default
         outline.usesAlternatingRowBackgroundColors = true
+        outline.selectionHighlightStyle = .regular
+        // Click, Shift-click, and Command-click are the table view's own
+        // selection. Command-A / Control-A and Delete are handled on the view
+        // so a text field never receives them from here.
+        outline.allowsMultipleSelection = true
+        outline.allowsEmptySelection = true
         outline.floatsGroupRows = false
         outline.indentationPerLevel = 13
         outline.autoresizesOutlineColumn = false
@@ -676,6 +857,22 @@ struct OutlinePanel: NSViewRepresentable {
         outline.delegate = coord
         outline.target = coord
         outline.doubleAction = #selector(Coordinator.doubleClicked(_:))
+        outline.onDelete = { [weak coord] in coord?.deleteSelected(nil) }
+        outline.prepareMenu = { [weak coord] in
+            guard let menu = coord?.outline?.menu else { return }
+            let title = coord?.model?.trashMenuTitle() ?? "Move to Trash"
+            menu.items.first { $0.action == #selector(Coordinator.deleteSelected(_:)) }?.title = title
+        }
+        let menu = NSMenu()
+        for (title, action) in [("Reveal in Finder", #selector(Coordinator.revealSelected(_:))),
+                                ("Copy Path", #selector(Coordinator.copySelected(_:))),
+                                ("Move to Trash", #selector(Coordinator.deleteSelected(_:)))] {
+            if action == #selector(Coordinator.deleteSelected(_:)) { menu.addItem(.separator()) }
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = coord
+            menu.addItem(item)
+        }
+        outline.menu = menu
 
         let scroll = NSScrollView()
         scroll.documentView = outline
@@ -688,6 +885,9 @@ struct OutlinePanel: NSViewRepresentable {
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         context.coordinator.model = model
+        // Read both so a list change and a map click each refresh this view.
+        _ = model.selection
+        _ = model.listSelection
         context.coordinator.rebuildIfNeeded()
         context.coordinator.syncSelection()
     }

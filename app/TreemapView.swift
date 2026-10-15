@@ -459,10 +459,14 @@ final class TreemapNSView: NSView {
 
     override func rightMouseDown(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
-        guard let model, let tree = model.tree, let leaf = hit(p) else { return }
-        model.selection = leaf.node
+        guard let model, model.tree != nil, let leaf = hit(p) else { return }
+        // A click on a row that is already selected keeps the rest of the
+        // selection; any other row becomes the only selection.
+        if !model.listSelection.contains(leaf.node) {
+            model.selection = leaf.node
+        }
         syncOverlay()
-        NodeMenu.popUp(path: tree.path(leaf.node), with: event, for: self)
+        NodeMenu.popUp(model: model, paths: model.selectedPaths(), with: event, for: self)
     }
 }
 
@@ -521,44 +525,38 @@ nonisolated private enum Scan {
 /// Right-click menu for a file or folder, shared by the treemap and rings.
 final class NodeMenu: NSObject {
     private static let shared = NodeMenu()
+    private var model: ScanModel?
 
-    static func popUp(path: String, with event: NSEvent, for view: NSView) {
+    static func popUp(model: ScanModel, paths: [String], with event: NSEvent, for view: NSView) {
+        shared.model = model
         let menu = NSMenu()
         for (title, action) in [("Reveal in Finder", #selector(revealInFinder(_:))),
                                 ("Copy Path", #selector(copyPath(_:))),
-                                ("Move to Trash", #selector(moveToTrash(_:)))] {
+                                (model.trashMenuTitle(), #selector(moveToTrash(_:)))] {
             if action == #selector(moveToTrash(_:)) { menu.addItem(.separator()) }
             let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
             item.target = shared
-            item.representedObject = path
+            item.representedObject = paths
+            item.isEnabled = !paths.isEmpty
             menu.addItem(item)
         }
         NSMenu.popUpContextMenu(menu, with: event, for: view)
     }
 
     @objc private func revealInFinder(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+        guard let paths = sender.representedObject as? [String], !paths.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(paths.map { URL(fileURLWithPath: $0) })
     }
 
     @objc private func copyPath(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String else { return }
+        guard let paths = sender.representedObject as? [String], !paths.isEmpty else { return }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(path, forType: .string)
+        NSPasteboard.general.setString(paths.joined(separator: "\n"), forType: .string)
     }
 
+    /// Trash every selected path, not the one row this menu was built on.
     @objc private func moveToTrash(_ sender: NSMenuItem) {
-        guard let path = sender.representedObject as? String else { return }
-        let url = URL(fileURLWithPath: path)
-        let alert = NSAlert()
-        alert.messageText = "Move \u{201C}\(url.lastPathComponent)\u{201D} to Trash?"
-        alert.informativeText = path
-        alert.addButton(withTitle: "Move to Trash")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            try? FileManager.default.trashItem(at: url, resultingItemURL: nil)
-            // Note: sizes refresh on next rescan; v1 keeps it simple.
-        }
+        model?.moveListSelectionToTrash()
     }
 }
 

@@ -606,11 +606,14 @@ final class AgentRun {
     private var process: Process?
     private let scanRoot: String
     private let tree: Tree
-    private let onFinish: () -> Void
+    /// After each step: paths that were deleted or moved, and paths to
+    /// rescan (cleanup commands change caches in place). The model edits the
+    /// scan in place instead of rescanning it.
+    private let onFinish: (_ changed: [String], _ refresh: [String]) -> Void
     private var preparationTask: Task<Void, Never>?
 
     init(agent: InstalledAgent, env: AgentEnvironment, tree: Tree, scanRoot: String,
-         known: [CleanupItem], onFinish: @escaping () -> Void) {
+         known: [CleanupItem], onFinish: @escaping (_ changed: [String], _ refresh: [String]) -> Void) {
         self.agent = agent
         self.scanRoot = scanRoot
         self.tree = tree
@@ -635,9 +638,10 @@ final class AgentRun {
 
     /// Folders to light up on the treemap: what the plan would remove.
     func highlights(in shown: Tree?) -> [Int] {
-        guard shown === tree, phase != .done else { return [] }
+        // An in-place edit keeps node ids, so the plan still lines up.
+        guard let shown, shown.origin == tree.origin, phase != .done else { return [] }
         return items.filter { $0.selected && $0.blocked == nil && $0.status != .done }
-            .flatMap(\.nodes)
+            .flatMap(\.nodes).filter { TreeEdit.isLive($0, in: shown) }
     }
 
     /// What step one moves to the Trash (tool caches wait for step two).
@@ -817,6 +821,8 @@ final class AgentRun {
         for item in items where !(item.selected && item.blocked == nil) { item.status = .skipped }
         let work = targets.filter { !$0.isCommand }
         for item in work { item.status = .running }
+        let root = scanRoot
+        let sink = TrashPermissionSink()
         Task {
             // Moving to the Trash is a rename; all of them at once, off the main thread.
             await withTaskGroup(of: Void.self) { group in
@@ -824,16 +830,69 @@ final class AgentRun {
                     let paths = item.paths
                     let dryRun = dryRun
                     group.addTask {
-                        let result = dryRun ? (moved: [URL](), error: String?.none) : await Self.trash(paths)
+                        let result = dryRun
+                            ? (moved: [URL](), failures: [TrashFailure]())
+                            : await Self.trash(paths, scanRoot: root)
                         await MainActor.run {
                             item.trashed = result.moved
-                            item.trashedBytes = dryRun || !result.moved.isEmpty ? item.bytes : 0
-                            withAnimation(.snappy) { item.status = result.error.map { .failed($0) } ?? .inTrash }
+                            let denied = result.failures.filter(\.permission)
+                            let hard = result.failures.filter { !$0.permission }
+                            sink.values.append(contentsOf: denied)
+                            if result.failures.isEmpty {
+                                item.trashedBytes = dryRun || !result.moved.isEmpty ? item.bytes : 0
+                                withAnimation(.snappy) { item.status = .inTrash }
+                            } else if !hard.isEmpty {
+                                item.trashedBytes = result.moved.isEmpty ? 0 : item.bytes
+                                withAnimation(.snappy) { item.status = .failed(hard[0].message) }
+                            } else {
+                                item.trashedBytes = result.moved.isEmpty ? 0 : item.bytes
+                                withAnimation(.snappy) { item.status = .failed("permission denied") }
+                            }
+                        }
+                    }
+                }
+            }
+            if !sink.values.isEmpty {
+                let retry = await TrashAdmin.retry(sink.values, scanRoot: root)
+                if !retry.cancelled {
+                    let asked = Set(sink.values.map(\.path))
+                    for item in work {
+                        let mine = item.paths.filter { asked.contains($0) }
+                        if mine.isEmpty { continue }
+                        for path in mine {
+                            if let dest = retry.moved[path] {
+                                item.trashed.append(URL(fileURLWithPath: dest))
+                            }
+                            if retry.removed.contains(path) {
+                                item.trashed.removeAll { $0.path == path }
+                            }
+                        }
+                        let still = retry.failures.filter { mine.contains($0.path) }
+                        let hard: Bool
+                        if case .failed(let message) = item.status { hard = message != "permission denied" }
+                        else { hard = false }
+                        if !still.isEmpty {
+                            withAnimation(.snappy) { item.status = .failed(still[0].message) }
+                        } else if !hard {
+                            if item.trashed.isEmpty {
+                                item.freed = item.bytes
+                                item.trashedBytes = 0
+                                withAnimation(.snappy) { item.status = .done }
+                            } else {
+                                item.trashedBytes = item.bytes
+                                withAnimation(.snappy) { item.status = .inTrash }
+                            }
                         }
                     }
                 }
             }
             withAnimation(.snappy) { phase = .staged }
+            if !dryRun {
+                // Moved into the Trash: gone from where they were, and if
+                // that Trash is inside the scan, they appear there.
+                let moved = work.flatMap { item in item.paths.filter { !TrashPlace.contains($0) } }
+                onFinish(moved, work.flatMap { $0.trashed.map(\.path) })
+            }
         }
     }
 
@@ -845,7 +904,10 @@ final class AgentRun {
         phase = .deleting
         let work = targets.filter { $0.status == .inTrash || ($0.isCommand && $0.status == .waiting) }
         for item in work { item.status = .running }
+        let removedPaths = work.flatMap { $0.trashed.map(\.path) }
         let before = Self.freeBytes()
+        let root = scanRoot
+        let sink = TrashPermissionSink()
         Task {
             await withTaskGroup(of: Void.self) { group in
                 for item in work {
@@ -855,6 +917,7 @@ final class AgentRun {
                     let dryRun = dryRun
                     group.addTask {
                         var error: String?
+                        var denied: [String] = []
                         if dryRun {
                             // Roughly as long as the real delete: bigger items finish later.
                             let gb = Double(bytes) / 1e9
@@ -862,13 +925,38 @@ final class AgentRun {
                         } else if let command {
                             error = await Self.runCommand(command, path: env.path)
                         } else {
-                            await Self.remove(urls)
+                            denied = await Self.remove(urls)
+                            if !denied.isEmpty { error = "permission denied" }
                         }
                         await MainActor.run {
                             item.trashed = []
                             item.trashedBytes = 0
-                            if error == nil { item.freed = item.bytes }
+                            if !denied.isEmpty {
+                                sink.pathsByItem[item.id] = denied
+                                sink.values.append(contentsOf: denied.map { path in
+                                    TrashFailure(label: (path as NSString).lastPathComponent, path: path,
+                                                 message: "permission denied", permission: true, inTrash: true,
+                                                 bytes: bytes)
+                                })
+                            } else if error == nil {
+                                item.freed = item.bytes
+                            }
                             withAnimation(.snappy) { item.status = error.map { .failed($0) } ?? .done }
+                        }
+                    }
+                }
+            }
+            if !sink.values.isEmpty {
+                let retry = await TrashAdmin.retry(sink.values, scanRoot: root)
+                if !retry.cancelled {
+                    for item in work {
+                        guard let paths = sink.pathsByItem[item.id] else { continue }
+                        if paths.allSatisfy({ retry.removed.contains($0) }) {
+                            item.freed = item.bytes
+                            withAnimation(.snappy) { item.status = .done }
+                        } else {
+                            let message = retry.failures.first { paths.contains($0.path) }?.message ?? "permission denied"
+                            withAnimation(.snappy) { item.status = .failed(message) }
                         }
                     }
                 }
@@ -887,25 +975,46 @@ final class AgentRun {
                 reclaimed = last > before ? last - before : 0
             }
             withAnimation(.snappy) { phase = .done }
-            if !dryRun { onFinish() }
+            if !dryRun {
+                onFinish(removedPaths, work.filter(\.isCommand).flatMap(\.paths))
+            }
         }
     }
 
-    /// Moves paths to the Trash; returns where they went and the first error.
-    nonisolated static func trash(_ paths: [String]) async -> (moved: [URL], error: String?) {
+    /// Moves paths to the Trash. A path already in a Trash is recorded as moved
+    /// so step two can delete it: `trashItem` cannot put a trash item into the Trash.
+    /// Permission errors are returned whole, for one administrator retry.
+    nonisolated static func trash(_ paths: [String], scanRoot: String) async -> (moved: [URL], failures: [TrashFailure]) {
         await Task.detached(priority: .userInitiated) {
             var moved: [URL] = []
-            var error: String?
+            var failures: [TrashFailure] = []
             for path in paths where FileManager.default.fileExists(atPath: path) {
+                if TrashPlace.contains(path) {
+                    if TrashSafety.allows(path, scanRoot: scanRoot) {
+                        moved.append(URL(fileURLWithPath: path))
+                    } else {
+                        failures.append(TrashFailure(
+                            label: (path as NSString).lastPathComponent, path: path,
+                            message: TrashSafety.refused(path).localizedDescription,
+                            permission: false, inTrash: true, bytes: 0))
+                    }
+                    continue
+                }
                 do {
-                    var out: NSURL?
-                    try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &out)
-                    if let out { moved.append(out as URL) }
-                } catch let failure {
-                    error = error ?? failure.localizedDescription
+                    if !TrashSafety.allows(path, scanRoot: scanRoot) {
+                        throw TrashSafety.refused(path)
+                    }
+                    let url = try Trash.move(path)
+                    moved.append(url ?? URL(fileURLWithPath: path))
+                } catch {
+                    let ns = error as NSError
+                    failures.append(TrashFailure(
+                        label: (path as NSString).lastPathComponent, path: path,
+                        message: ns.localizedDescription, permission: TrashError.isPermission(ns),
+                        inTrash: false, bytes: 0))
                 }
             }
-            return (moved, error)
+            return (moved, failures)
         }.value
     }
 
@@ -918,9 +1027,11 @@ final class AgentRun {
 
     /// Deletes folders for good, fast: each folder's children go through
     /// removefile(3) on the shared slots, then the folder itself.
-    nonisolated static func remove(_ urls: [URL]) async {
-        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+    /// Paths the process isn't allowed to remove come back for one administrator retry.
+    nonisolated static func remove(_ urls: [URL]) async -> [String] {
+        await withCheckedContinuation { (done: CheckedContinuation<[String], Never>) in
             deleteQueue.async {
+                let denied = DeniedPaths()
                 let group = DispatchGroup()
                 for url in urls {
                     for kid in (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? [] {
@@ -934,8 +1045,13 @@ final class AgentRun {
                     }
                 }
                 group.wait()
-                for url in urls { _ = removefile(url.path, nil, removefile_flags_t(REMOVEFILE_RECURSIVE)) }
-                done.resume()
+                for url in urls {
+                    if removefile(url.path, nil, removefile_flags_t(REMOVEFILE_RECURSIVE)) != 0 {
+                        let err = errno
+                        if err == EACCES || err == EPERM { denied.add(url.path) }
+                    }
+                }
+                done.resume(returning: denied.paths)
             }
         }
     }
@@ -983,6 +1099,28 @@ final class AgentRun {
             guard process.terminationStatus != 0 else { return nil }
             return tail.last.isEmpty ? "Exited with \(process.terminationStatus)" : tail.last
         }.value
+    }
+}
+
+/// Permission failures gathered on the main actor, then retried once.
+private final class TrashPermissionSink {
+    var values: [TrashFailure] = []
+    var pathsByItem: [UUID: [String]] = [:]
+}
+
+/// Paths `removefile` refused, collected from the shared delete queue.
+nonisolated final class DeniedPaths: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String] = []
+    func add(_ path: String) {
+        lock.lock()
+        values.append(path)
+        lock.unlock()
+    }
+    var paths: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return values
     }
 }
 

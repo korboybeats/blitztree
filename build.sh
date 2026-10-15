@@ -95,6 +95,15 @@ if [[ -n "$IDENTITY" ]]; then
     SIGN=(codesign --force --options runtime --timestamp --sign "$IDENTITY")
 else
     IDENTITY=$(awk -F'"' '/Apple Development/{print $2; exit}' <<<"$IDS")
+    if [[ -z "$IDENTITY" && -f "$SIGN_KC" ]]; then
+        # A self-signed local identity (see docs: `BlitzTree Local Signing`)
+        # is untrusted, so it is not in the "valid" list, but codesign can use
+        # it. Its designated requirement names the certificate rather than a
+        # cdhash, so Full Disk Access granted once survives every rebuild.
+        # Ad-hoc signing pins TCC grants to one exact binary.
+        IDENTITY=$(security find-identity -p codesigning "$SIGN_KC" 2>/dev/null \
+            | awk '/"BlitzTree Local Signing"/{print $2; exit}')
+    fi
     SIGN=(codesign --force --sign "${IDENTITY:--}")
 fi
 "${SIGN[@]}" "$SPARKLE_IN_APP/Versions/B/Autoupdate"

@@ -18,14 +18,30 @@ nonisolated enum Cleanup {
     /// Swift only supplies presentation paths; rules and labels live in cleanup.rs.
     static func find(in tree: Tree) -> [CleanupItem] {
         let home = NSHomeDirectory()
-        return (0..<tree.cleanupCount).map { index in
+        return (0..<tree.cleanupCount).compactMap { index in
             let node = Int(tree.cleanupNodes[index])
+            // Gone after an in-place delete (it, or a folder above it).
+            if tree.edit != nil && !TreeEdit.isLive(node, in: tree) { return nil }
             let path = tree.path(node)
             var display = tree.displayPath(node)
             if display.hasPrefix(home) { display = "~" + display.dropFirst(home.count) }
             return CleanupItem(node: node, path: path, display: display,
                                kind: tree.cleanupDescription(index), bytes: tree.alloc[node])
         }
+    }
+}
+
+/// One Trash move for the directory list, Clean Up, and the agent.
+///
+/// `trashItem(at:resultingItemURL:)` needs a real out-pointer. The list menu
+/// and Clean Up passed nil and, on the list, `try?` threw the error away.
+/// The file stayed in the last scan, so the delete looked like it did nothing.
+/// The agent path already kept the trashed URL; every caller goes through here.
+enum Trash {
+    nonisolated static func move(_ path: String) throws -> URL? {
+        var trashed: NSURL?
+        try FileManager.default.trashItem(at: URL(fileURLWithPath: path), resultingItemURL: &trashed)
+        return trashed.map { $0 as URL }
     }
 }
 
@@ -41,24 +57,45 @@ final class CleanupTrashBatch {
     func clearFailures() { failures = [] }
 
     @discardableResult
-    func start(_ items: [CleanupItem], completion: @escaping ([String]) -> Void) -> Task<Void, Never>? {
+    /// `completion` gets the failure lines and where each moved item went.
+    func start(_ items: [CleanupItem], scanRoot: String = "",
+               completion: @escaping (_ failed: [String], _ moved: [String: String]) async -> Void) -> Task<Void, Never>? {
         guard !running else { return nil }
         running = true
+        let root = scanRoot
         return Task {
-            let failed = await Task.detached(priority: .userInitiated) {
-                var failed: [String] = []
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (failed: [TrashFailure], ok: Int, moved: [String: String]) in
+                var failed: [TrashFailure] = []
+                var ok = 0
+                var moved: [String: String] = [:]
                 for item in items {
+                    let inTrash = TrashPlace.contains(item.path)
                     do {
-                        try FileManager.default.trashItem(at: URL(fileURLWithPath: item.path), resultingItemURL: nil)
+                        if !TrashSafety.allows(item.path, scanRoot: root) {
+                            throw TrashSafety.refused(item.path)
+                        }
+                        if inTrash {
+                            try Trash.removeNow(item.path, scanRoot: root)
+                        } else if let url = try Trash.move(item.path) {
+                            moved[item.path] = url.path
+                        }
+                        ok += 1
                     } catch {
-                        failed.append("\(item.display): \(error.localizedDescription)")
+                        let ns = error as NSError
+                        failed.append(TrashFailure(
+                            label: item.display, path: item.path, message: ns.localizedDescription,
+                            permission: TrashError.isPermission(ns), inTrash: inTrash, bytes: item.bytes))
                     }
                 }
-                return failed
+                return (failed, ok, moved)
             }.value
-            failures.append(contentsOf: failed)
+            // Permission errors share one administrator prompt. Anything else
+            // keeps the per-item line the offline benchmark checks.
+            let settled = await TrashRetry.settle(outcome.failed, succeeded: outcome.ok, scanRoot: root)
+            let strings = settled.failed.map { "\($0.label): \($0.message)" }
+            failures.append(contentsOf: strings)
             running = false
-            completion(failed)
+            await completion(strings, outcome.moved.merging(settled.moved) { a, _ in a })
         }
     }
 }
@@ -73,7 +110,6 @@ struct CleanupPanel: View {
     private var agent: InstalledAgent? { model.preferredAgent }
 
     private var pickedItems: [CleanupItem] { model.cleanup.filter { picked.contains($0.id) } }
-    private var pickedBytes: UInt64 { pickedItems.reduce(0) { $0 + $1.bytes } }
     private var totalBytes: UInt64 { model.cleanup.reduce(0) { $0 + $1.bytes } }
 
     var body: some View {
@@ -89,17 +125,52 @@ struct CleanupPanel: View {
                     .transition(.opacity)
             }
         }
-        .confirmationDialog(picked.count == 1 ? "Move 1 folder to the Trash?" : "Move \(picked.count) folders to the Trash?", isPresented: $confirming) {
-            Button("Move to Trash (\(Fmt.size(pickedBytes)))", role: .destructive) { trashPicked() }
+        .confirmationDialog(confirmTitle, isPresented: $confirming) {
+            Button(confirmButton, role: .destructive) { trashPicked() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("You can put them back from the Trash until you empty it. The tools that made them rebuild them when needed.")
+            Text(confirmMessage)
         }
-        .alert("Some folders couldn't be moved", isPresented: .constant(!model.cleanupTrash.failures.isEmpty)) {
-            Button("OK") { model.cleanupTrash.clearFailures() }
-        } message: {
-            Text(model.cleanupTrash.failures.joined(separator: "\n"))
+    }
+
+    /// Folders already in a Trash can't be moved there again. The dialog says
+    /// they'll be deleted for good; everything else still goes to the Trash.
+    private var actionable: [CleanupItem] {
+        pickedItems.filter { TrashSafety.allows($0.path, scanRoot: model.scanRoot) }
+    }
+    private var permanentPicked: [CleanupItem] { actionable.filter { TrashPlace.contains($0.path) } }
+    private var movablePicked: [CleanupItem] { actionable.filter { !TrashPlace.contains($0.path) } }
+
+    private var confirmTitle: String {
+        if permanentPicked.isEmpty {
+            let count = actionable.count
+            return count == 1 ? "Move 1 folder to the Trash?" : "Move \(count) folders to the Trash?"
         }
+        return deletionPrompt.title
+    }
+
+    private var confirmMessage: String {
+        if permanentPicked.isEmpty {
+            return "You can put them back from the Trash until you empty it. The tools that made them rebuild them when needed."
+        }
+        return deletionPrompt.message
+    }
+
+    private var confirmButton: String {
+        if permanentPicked.isEmpty {
+            return "Move to Trash (\(Fmt.size(movablePicked.reduce(0) { $0 + $1.bytes })))"
+        }
+        let bytes = actionable.reduce(0) { $0 + $1.bytes }
+        return "\(deletionPrompt.button) (\(Fmt.size(bytes)))"
+    }
+
+    private var deletionPrompt: TrashCopy.Prompt {
+        let named = actionable.count == 1 ? actionable.first?.display : nil
+        return TrashCopy.deletion(permanent: permanentPicked.count,
+                                  permanentBytes: permanentPicked.reduce(0) { $0 + $1.bytes },
+                                  move: movablePicked.count,
+                                  moveBytes: movablePicked.reduce(0) { $0 + $1.bytes },
+                                  name: named)
     }
 
     private var reclaimable: some View {
@@ -154,13 +225,12 @@ struct CleanupPanel: View {
                 Button {
                     confirming = true
                 } label: {
-                    Text(picked.isEmpty ? "Select folders to clean up"
-                         : "Move \(picked.count) to Trash · \(Fmt.size(pickedBytes))")
+                    Text(cleanupActionLabel)
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.large)
-                .disabled(picked.isEmpty || model.scanning || model.cleanupTrash.running)
+                .disabled(actionable.isEmpty || model.scanning || model.cleanupTrash.running)
             }
             .padding(12)
         }
@@ -241,11 +311,25 @@ struct CleanupPanel: View {
         }
     }
 
+    private var cleanupActionLabel: String {
+        if actionable.isEmpty { return "Select folders to clean up" }
+        let bytes = Fmt.size(actionable.reduce(0) { $0 + $1.bytes })
+        if permanentPicked.isEmpty { return "Move \(movablePicked.count) to Trash · \(bytes)" }
+        if movablePicked.isEmpty { return "Delete \(permanentPicked.count) permanently · \(bytes)" }
+        return "Delete \(permanentPicked.count) and move \(movablePicked.count) · \(bytes)"
+    }
+
     private func trashPicked() {
-        model.cleanupTrash.start(pickedItems) { _ in
+        let items = actionable
+        guard !items.isEmpty else { return }
+        model.cleanupTrash.start(items, scanRoot: model.scanRoot) { failed, moved in
             picked = []
-            // The batch clears its busy state before this final rescan.
-            model.startScan()
+            // Update the scan in place: no full rescan, the view stays put.
+            await model.applyDiskChanges(paths: items.map(\.path), moves: moved)
+            if !failed.isEmpty {
+                TrashUI.present(lines: failed)
+                model.cleanupTrash.clearFailures()
+            }
         }
     }
 

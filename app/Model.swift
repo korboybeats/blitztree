@@ -3,23 +3,46 @@ import SwiftUI
 import Foundation
 import Observation
 
-/// Zero-copy view over the Rust engine's flat tree arrays.
-/// Read-only after init, so sharing it across threads is safe.
+/// Zero-copy view over the Rust engine's flat tree arrays, or an edited copy
+/// of one (see `TreeEdit`). Immutable after init, so sharing it across
+/// threads is safe: an edit builds a new `Tree` and never touches this one.
+///
+/// Node ids are stable across edits. A deleted node keeps its slot, marked
+/// `removed` and unreachable from its old parent; nodes added by an edit
+/// (a rescanned folder, an item moved into a Trash inside the scan) get
+/// fresh ids after the last existing one.
 nonisolated final class Tree: @unchecked Sendable {
-    private let handle: OpaquePointer
+    private let handle: OpaquePointer?
+    /// The scan this tree came from: owns the engine arrays an edit shares
+    /// (names, cleanup candidates). `self` for a fresh scan.
+    private let scan: Tree?
+    /// Buffers an edited tree owns.
+    private let storage: TreeStorage?
     let count: Int
     let parents: UnsafePointer<UInt32>
     let alloc: UnsafePointer<UInt64>
     let logical: UnsafePointer<UInt64>
     let nFiles: UnsafePointer<UInt32>
+    /// bit0 = is_dir, bit7 = removed by an edit.
     let flags: UnsafePointer<UInt8>
     let childOff: UnsafePointer<UInt32>
     let childArr: UnsafePointer<UInt32>
-    let nameOff: UnsafePointer<UInt32>
-    let nameBlob: UnsafePointer<UInt8>
+    private let nameOff: UnsafePointer<UInt32>
+    private let nameBlob: UnsafePointer<UInt8>
+    /// Nodes `0..<scanNames` use the engine's name table.
+    private let scanNames: Int
+    /// Names added by edits: node id -> range in `extraBlob`.
+    private let extraNames: [Int: Range<Int>]
+    private let extraBlob: UnsafePointer<UInt8>?
     let cleanupCount: Int
     let cleanupNodes: UnsafePointer<UInt32>
     let errors: UInt64
+    /// Same for a scan and every edit of it.
+    let origin: UInt
+    /// What the edit that produced this tree changed, nil for a fresh scan.
+    let edit: TreeEditInfo?
+
+    static let removedFlag: UInt8 = 0x80
 
     init?(handle: OpaquePointer) {
         let n = bz_take_tree(handle)
@@ -36,6 +59,8 @@ nonisolated final class Tree: @unchecked Sendable {
               let cleanupNodes = bz_cleanup_nodes(handle)
         else { return nil }
         self.handle = handle
+        self.scan = nil
+        self.storage = nil
         self.count = Int(n)
         self.parents = parents
         self.alloc = alloc
@@ -46,25 +71,72 @@ nonisolated final class Tree: @unchecked Sendable {
         self.childArr = childArr
         self.nameOff = nameOff
         self.nameBlob = nameBlob
+        self.scanNames = Int(n)
+        self.extraNames = [:]
+        self.extraBlob = nil
         self.cleanupCount = Int(bz_cleanup_count(handle))
         self.cleanupNodes = cleanupNodes
         self.errors = bz_errors(handle)
+        self.origin = UInt(bitPattern: handle)
+        self.edit = nil
     }
 
-    deinit { bz_free(handle) }
+    /// An edited copy: `TreeEdit` filled `storage`'s arrays.
+    init(editing base: Tree, storage: TreeStorage, count: Int,
+         extraNames: [Int: Range<Int>], extraBlob: UnsafePointer<UInt8>?, edit: TreeEditInfo) {
+        let scan = base.scan ?? base
+        self.handle = nil
+        self.scan = scan
+        self.storage = storage
+        self.count = count
+        self.parents = UnsafePointer(storage.parents)
+        self.alloc = UnsafePointer(storage.alloc)
+        self.logical = UnsafePointer(storage.logical)
+        self.nFiles = UnsafePointer(storage.nFiles)
+        self.flags = UnsafePointer(storage.flags)
+        self.childOff = UnsafePointer(storage.childOff)
+        self.childArr = UnsafePointer(storage.childArr)
+        self.nameOff = scan.nameOff
+        self.nameBlob = scan.nameBlob
+        self.scanNames = scan.scanNames
+        self.extraNames = extraNames
+        self.extraBlob = extraBlob
+        self.cleanupCount = scan.cleanupCount
+        self.cleanupNodes = scan.cleanupNodes
+        self.errors = scan.errors
+        self.origin = base.origin
+        self.edit = edit
+    }
+
+    deinit { if let handle { bz_free(handle) } }
+
+    /// Nodes named by an edit rather than the engine.
+    var extraNameIDs: Dictionary<Int, Range<Int>>.Keys { extraNames.keys }
 
     func isDir(_ i: Int) -> Bool { flags[i] & 1 != 0 }
+    func isRemoved(_ i: Int) -> Bool { flags[i] & Self.removedFlag != 0 }
+    /// Files under `i` (a file counts itself).
+    func fileCount(_ i: Int) -> UInt64 { isDir(i) ? UInt64(nFiles[i]) : 1 }
 
     func cleanupDescription(_ index: Int) -> String {
-        guard let label = bz_cleanup_description(handle, UInt64(index)) else { return "" }
+        guard let handle = scan?.handle ?? handle,
+              let label = bz_cleanup_description(handle, UInt64(index)) else { return "" }
         return String(cString: label)
     }
 
-    func name(_ i: Int) -> String {
+    /// The node's name as UTF-8, without copying.
+    func nameBytes(_ i: Int) -> UnsafeBufferPointer<UInt8> {
+        if !extraNames.isEmpty, let range = extraNames[i], let extraBlob {
+            return UnsafeBufferPointer(start: extraBlob + range.lowerBound, count: range.count)
+        }
+        guard i < scanNames else { return UnsafeBufferPointer(start: nil, count: 0) }
         let start = Int(nameOff[i])
         let end = Int(nameOff[i + 1])
-        let buf = UnsafeBufferPointer(start: nameBlob + start, count: end - start)
-        return String(decoding: buf, as: UTF8.self)
+        return UnsafeBufferPointer(start: nameBlob + start, count: end - start)
+    }
+
+    func name(_ i: Int) -> String {
+        String(decoding: nameBytes(i), as: UTF8.self)
     }
 
     func children(_ i: Int) -> UnsafeBufferPointer<UInt32> {
@@ -153,6 +225,24 @@ enum MapStyle: String {
     case treemap, rings
 }
 
+/// Directory-list selection helpers shared by the outline and its tests.
+enum ListSelection {
+    /// Drop ids whose parent is also selected. Trashing a folder already
+    /// takes its selected children; trashing the child afterwards fails
+    /// because the path is gone.
+    static func outermost(_ ids: [Int], parents: UnsafePointer<UInt32>) -> [Int] {
+        let chosen = Set(ids)
+        return ids.filter { id in
+            var parent = Int(parents[id])
+            while parent != Int(UInt32.max) {
+                if chosen.contains(parent) { return false }
+                parent = Int(parents[parent])
+            }
+            return true
+        }
+    }
+}
+
 @Observable
 @MainActor
 final class ScanModel {
@@ -194,9 +284,9 @@ final class ScanModel {
         guard let tree, !scanning, !cleanupTrash.running else { return }
         UserDefaults.standard.set(agent.kind.rawValue, forKey: "bz.agent")
         agentRun?.cancel()
-        let run = AgentRun(agent: agent, env: agentEnv, tree: tree, scanRoot: scanRoot, known: cleanup) { [weak self] in
-            guard let self, !self.scanning else { return }
-            self.startScan()
+        let run = AgentRun(agent: agent, env: agentEnv, tree: tree, scanRoot: scanRoot, known: cleanup) { [weak self] changed, refresh in
+            guard let self else { return }
+            Task { await self.applyDiskChanges(paths: changed, refresh: refresh) }
         }
         withAnimation(.snappy) { agentRun = run }
     }
@@ -229,17 +319,248 @@ final class ScanModel {
     var hasShownTree = false
     var viewRoot: Int = 0 {
         didSet {
+            guard let tree else { return }
             // A selection outside the folder on screen would read as over 100%.
-            if let sel = selection, let tree, !tree.ancestry(sel).contains(viewRoot) { selection = nil }
+            if let sel = selection, !tree.ancestry(sel).contains(viewRoot) {
+                selection = nil
+                return
+            }
+            let kept = listSelection.filter { tree.ancestry($0).contains(viewRoot) }
+            if kept != listSelection {
+                selectionFromList = true
+                listSelection = kept
+                selectionFromList = false
+            }
         }
     }
-    var selection: Int? = nil
+    /// The row the map outlines. Assigning it from the map or a scan replaces
+    /// the directory list's selection with that one node. The list writes a
+    /// multi-selection through `replaceListSelection` instead.
+    var selection: Int? = nil {
+        didSet {
+            guard !selectionFromList else { return }
+            listSelection = selection.map { [$0] } ?? []
+        }
+    }
+    /// Nodes highlighted in the directory list, in outline row order.
+    var listSelection: [Int] = []
+    /// Set while the list is publishing its own selection, so `selection`'s
+    /// didSet does not collapse that selection back to one row.
+    private var selectionFromList = false
+    /// A directory-list trash is in flight. Scans wait until it finishes so
+    /// a rescan cannot snapshot the disk before the move lands.
+    var trashingSelection = false
 
     /// Select a node from a list, zooming out first if it is outside the
     /// folder on screen (it would have nothing to outline).
     func reveal(_ node: Int) {
         if let tree, !tree.ancestry(node).contains(viewRoot) { viewRoot = 0 }
         selection = node
+    }
+
+    /// Record the outline's selection without letting the single-node
+    /// assignment replace it.
+    func replaceListSelection(_ ids: [Int], anchor: Int?) {
+        selectionFromList = true
+        listSelection = ids
+        let next = anchor ?? ids.last
+        if selection != next { selection = next }
+        selectionFromList = false
+    }
+
+    func selectedPaths() -> [String] {
+        guard let tree else { return [] }
+        return listSelection.map { tree.path($0) }
+    }
+
+    /// Paths to move: a selected folder already contains its selected
+    /// descendants, and the scan root is the volume itself.
+    func pathsForTrash() -> [String] {
+        guard let tree else { return [] }
+        let root = tree.path(0)
+        var seen = Set<String>()
+        return ListSelection.outermost(listSelection, parents: tree.parents).compactMap { id in
+            guard id != 0 else { return nil }
+            let path = tree.path(id)
+            guard path != root, path != "/", seen.insert(path).inserted else { return nil }
+            guard TrashSafety.allows(path, scanRoot: root), TrashSafety.allows(path, scanRoot: scanRoot) else { return nil }
+            return path
+        }
+    }
+
+    /// Every selected path is already in a Trash, so Delete means permanent.
+    var listTrashIsPermanent: Bool {
+        let paths = pathsForTrash()
+        return !paths.isEmpty && paths.allSatisfy(TrashPlace.contains)
+    }
+
+    func trashMenuTitle() -> String {
+        let paths = pathsForTrash()
+        if paths.isEmpty { return "Move to Trash" }
+        if paths.allSatisfy(TrashPlace.contains) {
+            return paths.count == 1 ? "Delete Permanently" : "Delete \(paths.count) Permanently"
+        }
+        return paths.count == 1 ? "Move to Trash" : "Move \(paths.count) to Trash"
+    }
+
+    func moveListSelectionToTrash() {
+        movePathsToTrash(pathsForTrash())
+    }
+
+    /// Move every path, then update the scan in place (see `applyDiskChanges`):
+    /// the folder on screen, expanded rows, and scroll position stay put.
+    /// Items already in a Trash are deleted instead, and a permission
+    /// failure is retried once with an administrator password.
+    func movePathsToTrash(_ raw: [String]) {
+        guard let tree else { return }
+        var seen = Set<String>()
+        let root = tree.path(0)
+        var sizes: [String: UInt64] = [:]
+        for id in ListSelection.outermost(listSelection, parents: tree.parents) where id != 0 {
+            sizes[tree.path(id)] = tree.alloc[id]
+        }
+        let targets: [TrashTarget] = raw.compactMap { path in
+            guard !path.isEmpty, path != "/", seen.insert(path).inserted else { return nil }
+            guard TrashSafety.allows(path, scanRoot: root), TrashSafety.allows(path, scanRoot: scanRoot) else { return nil }
+            return TrashTarget(path: path, label: (path as NSString).lastPathComponent,
+                               bytes: sizes[path] ?? 0, inTrash: TrashPlace.contains(path))
+        }
+        // One delete at a time: a second Delete key or click while the
+        // confirmation, password dialog, or delete is up must not start
+        // another batch with its own dialogs.
+        guard !trashingSelection, !scanning, !cleanupTrash.running else { return }
+        if targets.isEmpty {
+            if raw.contains(where: { !$0.isEmpty && $0 != "/" }) {
+                let alert = NSAlert()
+                alert.messageText = "These items can't be deleted"
+                alert.informativeText = "The selection is the scan root, a home folder, or another system location."
+                alert.runModal()
+            }
+            return
+        }
+        // Without Full Disk Access, macOS blocks these even for an
+        // administrator. Say so up front instead of confirm, password, fail.
+        if targets.allSatisfy({ TrashAccess.privacyBlocked($0.path) }) {
+            TrashUI.present(targets.map {
+                TrashFailure(label: $0.label, path: $0.path, message: "", permission: false,
+                             inTrash: $0.inTrash, bytes: $0.bytes).blockedByPrivacy()
+            })
+            return
+        }
+        let permanent = targets.filter(\.inTrash)
+        let movable = targets.filter { !$0.inTrash }
+        trashingSelection = true
+        guard TrashUI.confirm(permanent: permanent, movable: movable) else {
+            trashingSelection = false
+            return
+        }
+        let scan = scanRoot
+        Task {
+            let outcome = await Task.detached(priority: .userInitiated) { () -> (failed: [TrashFailure], ok: Int, moved: [String: String]) in
+                var failed: [TrashFailure] = []
+                var ok = 0
+                var moved: [String: String] = [:]
+                for target in targets {
+                    do {
+                        if !TrashSafety.allows(target.path, scanRoot: scan) || !TrashSafety.allows(target.path, scanRoot: root) {
+                            throw TrashSafety.refused(target.path)
+                        }
+                        if target.inTrash {
+                            try Trash.removeNow(target.path, scanRoot: scan)
+                        } else if let url = try Trash.move(target.path) {
+                            moved[target.path] = url.path
+                        }
+                        ok += 1
+                    } catch {
+                        let ns = error as NSError
+                        failed.append(TrashFailure(
+                            label: target.label, path: target.path, message: ns.localizedDescription,
+                            permission: TrashError.isPermission(ns), inTrash: target.inTrash, bytes: target.bytes))
+                    }
+                }
+                return (failed, ok, moved)
+            }.value
+            let settled = await TrashRetry.settle(outcome.failed, succeeded: outcome.ok, scanRoot: scan)
+            if settled.succeeded > 0 {
+                await applyDiskChanges(paths: targets.map(\.path),
+                                       moves: outcome.moved.merging(settled.moved) { a, _ in a })
+            }
+            trashingSelection = false
+            if !settled.failed.isEmpty {
+                TrashUI.present(settled.failed)
+            }
+        }
+    }
+
+    // MARK: In-place updates after deletes
+
+    /// Edits run one after another against the newest tree.
+    private var editChain: Task<Void, Never>?
+
+    /// Bring the scan in line with the disk after deletes or moves, without
+    /// a full rescan. Each path is checked: gone means its node goes, still
+    /// there (a partial delete) means just that folder is rescanned. A move
+    /// into a Trash inside the scan re-homes the node there. `refresh` names
+    /// extra paths to rescan (e.g. caches a cleanup command changed).
+    /// Never rescans the scan root itself.
+    func applyDiskChanges(paths: [String], moves: [String: String] = [:], refresh: [String] = []) async {
+        let previous = editChain
+        let task = Task { @MainActor in
+            await previous?.value
+            guard let base = tree, !scanning else { return }
+            let selectionBefore = listSelection
+            let edited = await Task.detached(priority: .userInitiated) {
+                DiskChanges.edit(base, paths: paths, moves: moves, refresh: refresh)
+            }.value
+            // A new scan replaced the tree meanwhile: its ids are different.
+            guard let edited, tree === base, !scanning else { return }
+            install(edited, from: base, selectionBefore: selectionBefore)
+        }
+        editChain = task
+        await task.value
+    }
+
+    /// Swap in an edited tree, keeping the view on the same folder and
+    /// selecting what Finder would: the next row after the deleted ones.
+    func install(_ edited: Tree, from base: Tree, selectionBefore: [Int]) {
+        func live(_ i: Int) -> Bool { TreeEdit.isLive(i, in: edited) }
+        var root = viewRoot
+        while !live(root) {
+            let up = Int(edited.parents[root])
+            root = up == Int(UInt32.max) ? 0 : up
+        }
+        let kept = selectionBefore.filter(live)
+        var next: [Int] = kept
+        if next.isEmpty, let first = selectionBefore.first(where: { !live($0) }) {
+            next = DiskChanges.successor(of: first, removed: Set(selectionBefore), old: base, new: edited, viewRoot: root)
+                .map { [$0] } ?? []
+        }
+        selectionFromList = true
+        tree = edited
+        if root != viewRoot { viewRoot = root }
+        listSelection = next
+        selection = next.last
+        selectionFromList = false
+        if let h = hovered, !live(h) { hovered = nil }
+        let found = Cleanup.find(in: edited)
+        cleanup = found
+        refreshVolumeSpace(for: edited)
+    }
+
+    /// Free space after a delete: APFS frees a moment later, so read twice.
+    private func refreshVolumeSpace(for edited: Tree) {
+        let path = scanRoot
+        Task {
+            for delay in [0, 1500] {
+                if delay > 0 { try? await Task.sleep(for: .milliseconds(delay)) }
+                let space = await Task.detached(priority: .utility) { VolumeSpace.read(path) }.value
+                guard tree === edited else { return }
+                if let free = space.free { freeBytes = free }
+                if let used = space.used {
+                    unscannedBytes = used > edited.alloc[0] ? used - edited.alloc[0] : 0
+                }
+            }
+        }
     }
     var hovered: Int? = nil
     var freeBytes: UInt64 = 0
@@ -262,12 +583,15 @@ final class ScanModel {
     private var volumeTask: Task<VolumeSpace, Never>?
 
     func startScan(path: String? = nil) {
-        if scanning || cleanupTrash.running { return }
+        if scanning || cleanupTrash.running || trashingSelection { return }
         if let path { scanRoot = path }
         tree = nil
         cleanup = []
         viewRoot = 0
+        selectionFromList = true
+        listSelection = []
         selection = nil
+        selectionFromList = false
         hovered = nil
         files = 0; dirs = 0; bytes = 0; elapsed = 0
         lastPollAt = nil; maxPollGap = 0
